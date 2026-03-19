@@ -40,6 +40,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the release architecture that ships
 For planned Pi integration work, see [`docs/pi-integration-plan.md`](docs/pi-integration-plan.md).
 For Pi architecture context, see [`docs/pi-mono-architecture-notes.md`](docs/pi-mono-architecture-notes.md).
 For the tmux-first visible-session workflow, see [`docs/pi-layer-a-operator-guide.md`](docs/pi-layer-a-operator-guide.md).
+For the TUI-first observability contract, see [`docs/pi-tui-observability-contract.md`](docs/pi-tui-observability-contract.md).
 
 ## Good to use together
 

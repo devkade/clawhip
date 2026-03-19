@@ -50,6 +50,7 @@ Current gap:
 - `docs/pi-integration-plan.md` = implementation plan and architecture contract for Pi
 - `docs/pi-mono-architecture-notes.md` = what matters about Pi’s real architecture
 - `docs/pi-layer-a-operator-guide.md` = tmux-first visible-session workflow
+- `docs/pi-tui-observability-contract.md` = TUI-first runtime observability contract
 - `docs/native-event-contract.md` = canonical event normalization and routing contract for later structured integration
 - `docs/live-verification.md` = canonical verification checklist
 - `README.md` = entry-level operator overview and pointers
@@ -58,6 +59,7 @@ Current gap:
 
 - this document defines execution order and phase decisions
 - `pi-layer-a-operator-guide.md` defines the current primary operator workflow
+- `pi-tui-observability-contract.md` defines what clawhip must observe around a live Pi TUI session
 - `pi-mono-architecture-notes.md` explains why Pi should not be treated as just a renamed OMC/OMX target
 - `native-event-contract.md` remains the source of truth for future structured Pi-native routing
 

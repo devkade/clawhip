@@ -410,6 +410,10 @@ The next step should be:
 3. add auxiliary semantic sources only where TUI/tmux observation is insufficient
 4. then decide what should route into sinks or remain local visual/state data
 
+That contract now lives in:
+
+- `docs/pi-tui-observability-contract.md`
+
 In short:
 
 ```text
