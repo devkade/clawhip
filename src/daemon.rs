@@ -16,6 +16,7 @@ use crate::config::AppConfig;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, normalize_event};
+use crate::pi_state::{PiConfidence, PiSessionState, unix_now};
 use crate::pi_state_store::{SharedPiStateStore, new_shared_pi_state_store};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
@@ -111,11 +112,7 @@ where
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
-    Json(health_payload(
-        state.config.as_ref(),
-        state.port,
-        registered,
-    ))
+    Json(health_payload(state.config.as_ref(), state.port, registered))
 }
 
 fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize) -> Value {
@@ -141,6 +138,7 @@ async fn post_event(
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
     let event = normalize_event(event);
+    apply_pi_wrapper_event_to_state(&state.pi_state_store, &event).await;
     if let Err(error) = from_incoming_event(&event) {
         return (
             StatusCode::BAD_REQUEST,
@@ -287,6 +285,96 @@ async fn post_github(
             Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+async fn apply_pi_wrapper_event_to_state(store: &SharedPiStateStore, event: &IncomingEvent) {
+    if event.payload.get("tool").and_then(Value::as_str) != Some("pi") {
+        return;
+    }
+
+    let kind = event.canonical_kind();
+    if !matches!(kind, "session.started" | "session.finished" | "session.failed") {
+        return;
+    }
+
+    let session_name = event
+        .payload
+        .get("session_name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+    let Some(session_name) = session_name else {
+        return;
+    };
+
+    let project = event
+        .payload
+        .get("project")
+        .or_else(|| event.payload.get("repo_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(&session_name)
+        .to_string();
+    let repo_path = event
+        .payload
+        .get("repo_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let branch = event
+        .payload
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let now = unix_now();
+
+    let mut write = store.write().await;
+    let state = write.entry(session_name.clone()).or_insert_with(|| {
+        PiSessionState::new(
+            session_name.clone(),
+            project.clone(),
+            repo_path.clone(),
+            session_name.clone(),
+            branch.clone(),
+        )
+    });
+    state.sources.wrapper_emit = true;
+
+    match kind {
+        "session.started" => {
+            state.mark_running(now);
+            state.confidence.lifecycle = PiConfidence::High;
+        }
+        "session.finished" => {
+            state.mark_finished(now, Some(0));
+            state.confidence.lifecycle = PiConfidence::High;
+        }
+        "session.failed" => {
+            state.mark_failed(
+                now,
+                event
+                    .payload
+                    .get("error_message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    }),
+                None,
+            );
+            state.confidence.lifecycle = PiConfidence::High;
+        }
+        _ => {}
     }
 }
 
