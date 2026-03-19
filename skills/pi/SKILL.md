@@ -1,15 +1,15 @@
 # clawhip × Pi
 
-Launch Pi coding sessions with automatic clawhip notifications.
+Launch Pi coding sessions with a visible tmux-first workflow and clawhip monitoring.
 
 ## What you get
 
-- Preferred `session.*` wrapper emits for Pi lifecycle events
-- `tool = "pi"` metadata for stable route filtering
+- A live Pi session running in tmux so operators can attach and watch it work
 - Session keyword alerts (error, failed, PR created, complete, etc.)
 - Stale session detection (no output for N minutes)
+- Lightweight wrapper lifecycle emits as a secondary signal
 - All notifications routed by clawhip to the correct Discord/Slack sink
-- tmux remains available as a fallback/operator monitoring layer
+- A clean path toward richer Pi-native integration later
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Launch Pi coding sessions with automatic clawhip notifications.
 ./create.sh issue-123 ~/my-project/worktrees/issue-123 "Fix the bug in src/main.rs and create a PR to dev" 1234567890 "<@user-id>"
 ```
 
-`create.sh` launches Pi in a clawhip-monitored tmux session and emits `session.started`, `session.finished`, and `session.failed` directly from the shell wrapper. If you pass a prompt, the script waits 10 seconds for Pi to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
+`create.sh` launches Pi in a clawhip-monitored tmux session. The primary goal is to keep the session directly visible and attachable while clawhip handles keyword/stale alerts and route delivery. The wrapper also emits lightweight `session.started`, `session.finished`, and `session.failed` signals as a secondary notification layer. If you pass a prompt, the script waits 10 seconds for Pi to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
 
 ### Send a prompt
 
@@ -62,10 +62,22 @@ Launch Pi coding sessions with automatic clawhip notifications.
 | `CLAWHIP_PI_STALE_MIN` | `30` | Minutes before stale alert |
 | `CLAWHIP_PI_FLAGS` | *(empty)* | Extra flags passed to `pi` |
 | `CLAWHIP_PI_ENV` | *(empty)* | Extra env vars prepended to the Pi command |
-| `CLAWHIP_PI_PROJECT` | detected from the git common dir (fallback: worktree name) | Override the project name sent in lifecycle events |
+| `CLAWHIP_PI_PROJECT` | detected from the git common dir (fallback: worktree name) | Override the project name sent in wrapper lifecycle events |
 | `CLAWHIP_PI_BIN` | `pi` | Override the Pi executable |
 
-### Route example
+### Route examples
+
+Visible-session Layer A setups should usually start with tmux monitoring routes:
+
+```toml
+[[routes]]
+event = "tmux.*"
+channel = "1234567890"
+mention = "<@your-user-id>"
+format = "alert"
+```
+
+If you also want wrapper lifecycle messages, add a session route:
 
 ```toml
 [[routes]]

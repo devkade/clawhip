@@ -79,11 +79,12 @@ ARGS+=(-- "$PI_CMD")
 
 nohup clawhip "${ARGS[@]}" &>/dev/null &
 
-echo "✓ Created session: $SESSION in $WORKDIR (clawhip monitored)"
+echo "✓ Created visible Pi session: $SESSION in $WORKDIR (clawhip monitored)"
 echo "  Project: $PROJECT"
 echo "  Tool:    $PI_BIN"
-echo "  Monitor: tmux attach -t $SESSION"
+echo "  Attach:  tmux attach -t $SESSION"
 echo "  Tail:    $(dirname "$0")/tail.sh $SESSION"
+echo "  Notes:   tmux is the primary live view; clawhip alerts are secondary"
 
 if [ -n "$PROMPT" ]; then
   sleep 10
