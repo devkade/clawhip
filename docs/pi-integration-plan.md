@@ -68,13 +68,13 @@ Current gap:
 Current primary model:
 
 ```text
-Pi in tmux -> clawhip tmux watch/new -> keyword + stale alerts -> Discord/Slack
+Pi TUI in tmux -> clawhip observability around the live session -> keyword/stale/state collection -> route/render/sinks
 ```
 
-Later structured model:
+Optional later auxiliary model:
 
 ```text
-Pi native JSON/RPC/extension events -> clawhip normalization/routing -> Discord/Slack
+Pi JSON/RPC/extension signals -> enrich clawhip state when TUI/tmux observation alone is insufficient
 ```
 
 ### Design principle
