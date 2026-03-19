@@ -156,6 +156,12 @@ impl PiSessionState {
         self.touch(now);
     }
 
+    pub fn mark_blocked_or_waiting(&mut self, now: u64) {
+        self.activity = PiActivity::BlockedOrWaiting;
+        self.confidence.activity = PiConfidence::Low;
+        self.touch(now);
+    }
+
     pub fn mark_stale(&mut self, now: u64) {
         self.stale = true;
         self.touch(now);
@@ -234,5 +240,21 @@ mod tests {
         assert_eq!(state.lifecycle, PiLifecycle::Running);
         assert_eq!(state.activity, PiActivity::Idle);
         assert!(state.stale);
+    }
+
+    #[test]
+    fn blocked_waiting_state_is_distinct_from_idle() {
+        let mut state = PiSessionState::new(
+            "issue-1".into(),
+            "repo".into(),
+            "/repo".into(),
+            "issue-1".into(),
+            None,
+        );
+        state.mark_running(100);
+        state.mark_blocked_or_waiting(140);
+        assert_eq!(state.lifecycle, PiLifecycle::Running);
+        assert_eq!(state.activity, PiActivity::BlockedOrWaiting);
+        assert_eq!(state.confidence.activity, PiConfidence::Low);
     }
 }

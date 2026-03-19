@@ -361,7 +361,8 @@ async fn poll_tmux(
                                 .await;
                                 Some(hits)
                             } else {
-                                let stale = should_emit_stale(existing, now, registration.stale_minutes);
+                                let stale =
+                                    should_emit_stale(existing, now, registration.stale_minutes);
                                 update_pi_state_without_pane_change(
                                     pi_state_store,
                                     registration,
@@ -494,9 +495,12 @@ async fn update_pi_state_without_pane_change(
     if stale {
         state.mark_stale(now);
     } else if last_change.elapsed() >= Duration::from_secs(120) {
-        state.activity = PiActivity::Idle;
-        state.confidence.activity = PiConfidence::Low;
-        state.touch(now);
+        let last_line = state.last_observed_text.clone().unwrap_or_default();
+        if looks_like_pi_blocked_or_waiting(&last_line) {
+            state.mark_blocked_or_waiting(now);
+        } else {
+            state.mark_idle(now);
+        }
     }
 }
 
@@ -518,6 +522,49 @@ async fn update_pi_state_on_disappearance(
     state.mark_finished(now, None);
     state.attachable = false;
     state.confidence.lifecycle = PiConfidence::Low;
+}
+
+fn looks_like_pi_blocked_or_waiting(line: &str) -> bool {
+    let normalized = line.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let strong_markers = [
+        "waiting for input",
+        "need your input",
+        "awaiting your input",
+        "question for user",
+        "press enter to continue",
+        "press any key to continue",
+        "hit enter to continue",
+        "select an option",
+        "choose an option",
+        "waiting for review",
+        "approval required",
+    ];
+    if strong_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return true;
+    }
+
+    let question_markers = [
+        "continue",
+        "approve",
+        "choose",
+        "select",
+        "which",
+        "what should",
+        "would you like",
+        "y/n",
+        "yes/no",
+    ];
+    normalized.contains('?')
+        && question_markers
+            .iter()
+            .any(|marker| normalized.contains(marker))
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -1096,5 +1143,20 @@ error: failed";
         let event = rx.recv().await.unwrap();
         assert_eq!(event.payload["keyword"], "error");
         assert_eq!(event.payload["line"], "error: failed");
+    }
+
+    #[test]
+    fn blocked_waiting_heuristic_detects_clear_waiting_prompt() {
+        assert!(looks_like_pi_blocked_or_waiting(
+            "Waiting for input from user"
+        ));
+        assert!(looks_like_pi_blocked_or_waiting(
+            "Would you like to continue?"
+        ));
+        assert!(looks_like_pi_blocked_or_waiting(
+            "Approval required before proceeding"
+        ));
+        assert!(!looks_like_pi_blocked_or_waiting("Running cargo test..."));
+        assert!(!looks_like_pi_blocked_or_waiting("Finished writing files"));
     }
 }
