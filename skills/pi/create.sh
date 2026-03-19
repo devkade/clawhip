@@ -17,6 +17,7 @@ PI_FLAGS="${CLAWHIP_PI_FLAGS:-}"
 PI_ENV="${CLAWHIP_PI_ENV:-}"
 PI_BIN_OVERRIDE="${CLAWHIP_PI_BIN:-}"
 PROMPT_DELAY="${CLAWHIP_PI_PROMPT_DELAY:-10}"
+CLAWHIP_BIN_OVERRIDE="${CLAWHIP_BIN:-}"
 
 if [ ! -d "$WORKDIR" ]; then
   echo "❌ Directory not found: $WORKDIR"
@@ -66,6 +67,41 @@ resolve_pi_command() {
   return 1
 }
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+clawhip_repo_root="$(cd "$script_dir/../.." && pwd)"
+
+resolve_clawhip_command() {
+  if [ -n "$CLAWHIP_BIN_OVERRIDE" ]; then
+    CLAWHIP_CMD=("$CLAWHIP_BIN_OVERRIDE")
+    return 0
+  fi
+
+  if command -v clawhip >/dev/null 2>&1; then
+    CLAWHIP_CMD=("$(command -v clawhip)")
+    return 0
+  fi
+
+  if command -v cargo >/dev/null 2>&1 && [ -f "$clawhip_repo_root/Cargo.toml" ] && [ -f "$clawhip_repo_root/src/main.rs" ]; then
+    CLAWHIP_CMD=(cargo run --quiet --manifest-path "$clawhip_repo_root/Cargo.toml" --)
+    return 0
+  fi
+
+  return 1
+}
+
+quote() {
+  printf '%q' "$1"
+}
+
+shell_join() {
+  local out=""
+  local part
+  for part in "$@"; do
+    printf -v out '%s%q ' "$out" "$part"
+  done
+  printf '%s' "${out% }"
+}
+
 PROJECT="${CLAWHIP_PI_PROJECT:-$(detect_project)}"
 PI_CMD_PATH="$(resolve_pi_command || true)"
 
@@ -73,6 +109,13 @@ if [ -z "$PI_CMD_PATH" ]; then
   echo "❌ Could not find Pi executable. Set CLAWHIP_PI_BIN or run from inside a pi-mono checkout with pi-test.sh present."
   exit 1
 fi
+
+CLAWHIP_CMD=()
+resolve_clawhip_command || {
+  echo "❌ Could not find clawhip launcher. Set CLAWHIP_BIN, install clawhip, or run from inside a clawhip repo with cargo available."
+  exit 1
+}
+CLAWHIP_SHELL_CMD="$(shell_join "${CLAWHIP_CMD[@]}")"
 
 ARGS=(
   tmux new
@@ -93,38 +136,51 @@ if [ ${#EMIT_ARGS[@]} -gt 0 ]; then
   printf -v EMIT_SUFFIX ' %q' "${EMIT_ARGS[@]}"
 fi
 
-quote() {
-  printf '%q' "$1"
-}
-
 DISPLAY_CMD="$PI_CMD_PATH${PI_FLAGS:+ $PI_FLAGS}"
-
-PI_SESSION_CMD=$(cat <<EOF
-source ~/.zshrc
-START_TS=\$(date +%s)
+SESSION_SCRIPT="$(mktemp "/tmp/clawhip-pi-${SESSION}.XXXXXX.sh")"
+chmod +x "$SESSION_SCRIPT"
+cat > "$SESSION_SCRIPT" <<EOF
+#!/bin/bash
+set -euo pipefail
 cleanup() {
   local exit_code=\$?
   local elapsed=\$(( \$(date +%s) - START_TS ))
   if [ "\$exit_code" -eq 0 ]; then
-    clawhip emit session.finished --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --elapsed "\$elapsed" --summary "Pi session finished"$EMIT_SUFFIX || true
+    $CLAWHIP_SHELL_CMD emit session.finished --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --elapsed "\$elapsed" --summary "Pi session finished"$EMIT_SUFFIX || true
   else
-    clawhip emit session.failed --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --elapsed "\$elapsed" --error "exit \$exit_code" --summary "Pi session failed"$EMIT_SUFFIX || true
+    $CLAWHIP_SHELL_CMD emit session.failed --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --elapsed "\$elapsed" --error "exit \$exit_code" --summary "Pi session failed"$EMIT_SUFFIX || true
   fi
+  rm -f "$SESSION_SCRIPT"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-clawhip emit session.started --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --summary "Pi session started"$EMIT_SUFFIX || true
+START_TS=\$(date +%s)
+$CLAWHIP_SHELL_CMD emit session.started --tool pi --tool_name pi --session_name $(quote "$SESSION") --session_id $(quote "$SESSION") --repo_name $(quote "$PROJECT") --repo_path $(quote "$WORKDIR") --command $(quote "$DISPLAY_CMD") --summary "Pi session started"$EMIT_SUFFIX || true
 ${PI_ENV:+$PI_ENV }$(quote "$PI_CMD_PATH") $PI_FLAGS
 EOF
-)
 
-ARGS+=(-- "$PI_SESSION_CMD")
+ARGS+=(-- "$SESSION_SCRIPT")
 
-nohup clawhip "${ARGS[@]}" &>/dev/null &
+nohup "${CLAWHIP_CMD[@]}" "${ARGS[@]}" &>/dev/null &
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "❌ Failed to create tmux session: $SESSION"
+  echo "   Tried clawhip launcher: $CLAWHIP_SHELL_CMD"
+  rm -f "$SESSION_SCRIPT"
+  exit 1
+fi
 
 echo "✓ Created visible Pi session: $SESSION in $WORKDIR (clawhip monitored)"
 echo "  Project: $PROJECT"
 echo "  Command: $DISPLAY_CMD"
+echo "  Clawhip: $CLAWHIP_SHELL_CMD"
 echo "  Attach:  tmux attach -t $SESSION"
 echo "  Tail:    $(dirname "$0")/tail.sh $SESSION"
 echo "  Notes:   tmux is the primary live view; clawhip alerts are secondary"
