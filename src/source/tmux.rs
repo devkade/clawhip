@@ -519,9 +519,24 @@ async fn update_pi_state_on_disappearance(
     let Some(state) = write.get_mut(session_name) else {
         return;
     };
-    state.mark_finished(now, None);
-    state.attachable = false;
-    state.confidence.lifecycle = PiConfidence::Low;
+
+    match state.lifecycle {
+        crate::pi_state::PiLifecycle::Finished | crate::pi_state::PiLifecycle::Failed => {
+            state.attachable = false;
+            state.touch(now);
+        }
+        crate::pi_state::PiLifecycle::Aborted => {
+            state.attachable = false;
+            state.touch(now);
+        }
+        crate::pi_state::PiLifecycle::Created
+        | crate::pi_state::PiLifecycle::Running
+        | crate::pi_state::PiLifecycle::Unknown => {
+            state.mark_aborted(now);
+            state.attachable = false;
+            state.confidence.lifecycle = PiConfidence::Low;
+        }
+    }
 }
 
 fn looks_like_pi_blocked_or_waiting(line: &str) -> bool {
@@ -1158,5 +1173,59 @@ error: failed";
         ));
         assert!(!looks_like_pi_blocked_or_waiting("Running cargo test..."));
         assert!(!looks_like_pi_blocked_or_waiting("Finished writing files"));
+    }
+
+    #[tokio::test]
+    async fn disappearance_marks_running_pi_session_aborted() {
+        let store = crate::pi_state_store::new_shared_pi_state_store();
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+        ensure_pi_state_exists(&store, &registration, &registration.session).await;
+        {
+            let mut write = store.write().await;
+            let state = write.get_mut(&registration.session).expect("state present");
+            state.mark_running(100);
+        }
+
+        update_pi_state_on_disappearance(&store, &registration, &registration.session).await;
+
+        let read = store.read().await;
+        let state = read.get(&registration.session).expect("state present");
+        assert!(matches!(
+            state.lifecycle,
+            crate::pi_state::PiLifecycle::Aborted
+        ));
+        assert!(!state.attachable);
+    }
+
+    #[tokio::test]
+    async fn disappearance_does_not_override_failed_state() {
+        let store = crate::pi_state_store::new_shared_pi_state_store();
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+        ensure_pi_state_exists(&store, &registration, &registration.session).await;
+        {
+            let mut write = store.write().await;
+            let state = write.get_mut(&registration.session).expect("state present");
+            state.mark_failed(100, Some("boom".into()), None);
+        }
+
+        update_pi_state_on_disappearance(&store, &registration, &registration.session).await;
+
+        let read = store.read().await;
+        let state = read.get(&registration.session).expect("state present");
+        assert!(matches!(
+            state.lifecycle,
+            crate::pi_state::PiLifecycle::Failed
+        ));
+        assert_eq!(state.failure_reason.as_deref(), Some("boom"));
     }
 }
