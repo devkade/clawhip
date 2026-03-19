@@ -10,6 +10,8 @@ mod events;
 mod keyword_window;
 mod lifecycle;
 mod memory;
+mod pi_state;
+mod pi_state_store;
 mod plugins;
 mod render;
 mod router;

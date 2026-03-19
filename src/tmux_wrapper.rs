@@ -43,6 +43,10 @@ struct TmuxMonitorArgs {
     keyword_window_secs: u64,
     stale_minutes: u64,
     format: Option<TmuxWrapperFormat>,
+    tool: Option<String>,
+    project: Option<String>,
+    repo_path: Option<String>,
+    branch: Option<String>,
 }
 
 impl From<&TmuxNewArgs> for TmuxMonitorArgs {
@@ -55,6 +59,10 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
             keyword_window_secs: default_keyword_window_secs(),
             stale_minutes: value.stale_minutes,
             format: value.format,
+            tool: value.tool.clone(),
+            project: value.project.clone(),
+            repo_path: value.repo_path.clone(),
+            branch: value.branch.clone(),
         }
     }
 }
@@ -69,6 +77,10 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
             keyword_window_secs: default_keyword_window_secs(),
             stale_minutes: value.stale_minutes,
             format: value.format,
+            tool: value.tool.clone(),
+            project: value.project.clone(),
+            repo_path: value.repo_path.clone(),
+            branch: value.branch.clone(),
         }
     }
 }
@@ -84,6 +96,10 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             stale_minutes: value.stale_minutes,
             format: value.format.map(Into::into),
             active_wrapper_monitor: true,
+            tool: value.tool,
+            project: value.project,
+            repo_path: value.repo_path,
+            branch: value.branch,
         }
     }
 }
@@ -304,6 +320,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            tool: None,
+            project: None,
+            repo_path: None,
+            branch: None,
             command: vec![
                 "zsh".into(),
                 "-c".into(),
@@ -333,6 +353,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: Some("/bin/zsh".into()),
+            tool: None,
+            project: None,
+            repo_path: None,
+            branch: None,
             command: vec!["source ~/.zshrc && omx --madmax".into()],
         };
 
@@ -358,6 +382,10 @@ mod tests {
             retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
             retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: None,
+            tool: None,
+            project: None,
+            repo_path: None,
+            branch: None,
             command: vec!["source ~/.zshrc && omx --madmax".into()],
         };
 
@@ -377,6 +405,10 @@ mod tests {
             stale_minutes: 15,
             format: Some(TmuxWrapperFormat::Inline),
             retry_enter: true,
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            branch: Some("main".into()),
         };
 
         let monitor_args = TmuxMonitorArgs::from(&args);
@@ -391,6 +423,7 @@ mod tests {
             monitor_args.format,
             Some(TmuxWrapperFormat::Inline)
         ));
+        assert_eq!(monitor_args.tool.as_deref(), Some("pi"));
     }
 
     #[test]

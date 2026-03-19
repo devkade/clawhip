@@ -13,6 +13,8 @@ use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
+use crate::pi_state::{PiActivity, PiConfidence, PiSessionState, unix_now};
+use crate::pi_state_store::SharedPiStateStore;
 use crate::source::Source;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
@@ -30,6 +32,14 @@ pub struct RegisteredTmuxSession {
     pub format: Option<MessageFormat>,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -43,6 +53,10 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             stale_minutes: value.stale_minutes,
             format: value.format.clone(),
             active_wrapper_monitor: false,
+            tool: None,
+            project: None,
+            repo_path: None,
+            branch: None,
         }
     }
 }
@@ -50,11 +64,20 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
 pub struct TmuxSource {
     config: Arc<AppConfig>,
     registry: SharedTmuxRegistry,
+    pi_state_store: SharedPiStateStore,
 }
 
 impl TmuxSource {
-    pub fn new(config: Arc<AppConfig>, registry: SharedTmuxRegistry) -> Self {
-        Self { config, registry }
+    pub fn new(
+        config: Arc<AppConfig>,
+        registry: SharedTmuxRegistry,
+        pi_state_store: SharedPiStateStore,
+    ) -> Self {
+        Self {
+            config,
+            registry,
+            pi_state_store,
+        }
     }
 }
 
@@ -68,7 +91,14 @@ impl Source for TmuxSource {
         let mut state = TmuxMonitorState::default();
 
         loop {
-            poll_tmux(self.config.as_ref(), &self.registry, &tx, &mut state).await?;
+            poll_tmux(
+                self.config.as_ref(),
+                &self.registry,
+                &self.pi_state_store,
+                &tx,
+                &mut state,
+            )
+            .await?;
             sleep(Duration::from_secs(
                 self.config.monitors.poll_interval_secs.max(1),
             ))
@@ -218,6 +248,7 @@ pub async fn monitor_registered_session(
 async fn poll_tmux(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
+    pi_state_store: &SharedPiStateStore,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
@@ -290,6 +321,7 @@ async fn poll_tmux(
                     let now = Instant::now();
                     let hash = content_hash(&pane.content);
                     let latest_line = last_nonempty_line(&pane.content);
+                    ensure_pi_state_exists(pi_state_store, registration, session_name).await;
 
                     let hits = match state.panes.get_mut(&pane_key) {
                         None => {
@@ -366,6 +398,108 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+async fn ensure_pi_state_exists(
+    store: &SharedPiStateStore,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+) {
+    if registration.tool.as_deref() != Some("pi") {
+        return;
+    }
+
+    let mut write = store.write().await;
+    write.entry(session_name.to_string()).or_insert_with(|| {
+        PiSessionState::new(
+            session_name.to_string(),
+            registration
+                .project
+                .clone()
+                .unwrap_or_else(|| session_name.to_string()),
+            registration.repo_path.clone().unwrap_or_default(),
+            registration.session.clone(),
+            registration.branch.clone(),
+        )
+    });
+}
+
+async fn update_pi_state_on_pane_change(
+    store: &SharedPiStateStore,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+    pane_content: &str,
+) {
+    if registration.tool.as_deref() != Some("pi") {
+        return;
+    }
+
+    let now = unix_now();
+    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
+        store.write().await;
+    let state = write.entry(session_name.to_string()).or_insert_with(|| {
+        PiSessionState::new(
+            session_name.to_string(),
+            registration
+                .project
+                .clone()
+                .unwrap_or_else(|| session_name.to_string()),
+            registration.repo_path.clone().unwrap_or_default(),
+            registration.session.clone(),
+            registration.branch.clone(),
+        )
+    });
+    state.mark_running(now);
+    state.mark_pane_change(now, last_nonempty_line(pane_content));
+}
+
+async fn update_pi_state_without_pane_change(
+    store: &SharedPiStateStore,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+    last_change: Instant,
+    stale: bool,
+) {
+    if registration.tool.as_deref() != Some("pi") {
+        return;
+    }
+
+    let now = unix_now();
+    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
+        store.write().await;
+    let Some(state) = write.get_mut(session_name) else {
+        return;
+    };
+    state.attachable = true;
+    state.sources.tmux_exists = true;
+    state.touch(now);
+    if stale {
+        state.mark_stale(now);
+    } else if last_change.elapsed() >= Duration::from_secs(120) {
+        state.activity = PiActivity::Idle;
+        state.confidence.activity = PiConfidence::Low;
+        state.touch(now);
+    }
+}
+
+async fn update_pi_state_on_disappearance(
+    store: &SharedPiStateStore,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+) {
+    if registration.tool.as_deref() != Some("pi") {
+        return;
+    }
+
+    let now = unix_now();
+    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
+        store.write().await;
+    let Some(state) = write.get_mut(session_name) else {
+        return;
+    };
+    state.mark_finished(now, None);
+    state.attachable = false;
+    state.confidence.lifecycle = PiConfidence::Low;
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -607,6 +741,10 @@ mod tests {
             stale_minutes: 15,
             format: Some(MessageFormat::Compact),
             active_wrapper_monitor: false,
+            tool: None,
+            project: None,
+            repo_path: None,
+            branch: None,
         }
     }
 

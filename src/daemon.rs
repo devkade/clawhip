@@ -16,6 +16,7 @@ use crate::config::AppConfig;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, normalize_event};
+use crate::pi_state_store::{SharedPiStateStore, new_shared_pi_state_store};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
@@ -31,6 +32,8 @@ struct AppState {
     port: u16,
     tx: mpsc::Sender<IncomingEvent>,
     tmux_registry: SharedTmuxRegistry,
+    #[allow(dead_code)]
+    pi_state_store: SharedPiStateStore,
 }
 
 pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<()> {
@@ -47,6 +50,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let pi_state_store: SharedPiStateStore = new_shared_pi_state_store();
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
@@ -58,7 +62,11 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     spawn_source(GitSource::new(config.clone()), tx.clone());
     spawn_source(GitHubSource::new(config.clone()), tx.clone());
     spawn_source(
-        TmuxSource::new(config.clone(), tmux_registry.clone()),
+        TmuxSource::new(
+            config.clone(),
+            tmux_registry.clone(),
+            pi_state_store.clone(),
+        ),
         tx.clone(),
     );
 
@@ -77,6 +85,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         port,
         tx,
         tmux_registry,
+        pi_state_store,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;

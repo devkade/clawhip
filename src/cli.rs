@@ -354,6 +354,14 @@ pub struct TmuxNewArgs {
     pub retry_enter_delay_ms: u64,
     #[arg(long)]
     pub shell: Option<String>,
+    #[arg(long)]
+    pub tool: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub repo_path: Option<String>,
+    #[arg(long)]
+    pub branch: Option<String>,
     #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
@@ -374,6 +382,14 @@ pub struct TmuxWatchArgs {
     pub format: Option<TmuxWrapperFormat>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_enter: bool,
+    #[arg(long)]
+    pub tool: Option<String>,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub repo_path: Option<String>,
+    #[arg(long)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

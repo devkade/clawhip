@@ -121,6 +121,9 @@ ARGS=(
   tmux new
   -s "$SESSION"
   -c "$WORKDIR"
+  --tool pi
+  --project "$PROJECT"
+  --repo-path "$WORKDIR"
   --keywords "$KEYWORDS"
   --stale-minutes "$STALE_MIN"
 )
