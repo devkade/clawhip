@@ -51,6 +51,7 @@ Current gap:
 - `docs/pi-mono-architecture-notes.md` = what matters about Pi’s real architecture
 - `docs/pi-layer-a-operator-guide.md` = tmux-first visible-session workflow
 - `docs/pi-tui-observability-contract.md` = TUI-first runtime observability contract
+- `docs/pi-session-state-model.md` = first internal state object for Pi TUI-observed sessions
 - `docs/native-event-contract.md` = canonical event normalization and routing contract for later structured integration
 - `docs/live-verification.md` = canonical verification checklist
 - `README.md` = entry-level operator overview and pointers

@@ -413,6 +413,7 @@ The next step should be:
 That contract now lives in:
 
 - `docs/pi-tui-observability-contract.md`
+- `docs/pi-session-state-model.md`
 
 In short:
 

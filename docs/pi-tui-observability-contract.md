@@ -178,7 +178,7 @@ But to reach **OMC-class operational usefulness** in clawhip, all of the followi
 
 ### Stretch outcome set
 - cycle-awareness
-n- tool-awareness
+- tool-awareness
 - blocked/question-needed semantics
 - native semantic enrichment from auxiliary sources
 
@@ -261,4 +261,6 @@ Only then decide whether auxiliary JSON/RPC enrichment is worth adding.
 - `docs/pi-layer-a-operator-guide.md` explains operator workflow
 - `docs/pi-integration-plan.md` explains rollout order
 - `docs/pi-native-parity-spec.md` explains target parity and gap analysis
+- this document explains the **runtime observability contract** for the TUI-first model
+ this contract
 - this document explains the **runtime observability contract** for the TUI-first model

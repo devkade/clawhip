@@ -41,6 +41,7 @@ For planned Pi integration work, see [`docs/pi-integration-plan.md`](docs/pi-int
 For Pi architecture context, see [`docs/pi-mono-architecture-notes.md`](docs/pi-mono-architecture-notes.md).
 For the tmux-first visible-session workflow, see [`docs/pi-layer-a-operator-guide.md`](docs/pi-layer-a-operator-guide.md).
 For the TUI-first observability contract, see [`docs/pi-tui-observability-contract.md`](docs/pi-tui-observability-contract.md).
+For the first Pi session state model, see [`docs/pi-session-state-model.md`](docs/pi-session-state-model.md).
 
 ## Good to use together
 
