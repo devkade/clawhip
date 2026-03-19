@@ -52,15 +52,15 @@ resolve_pi_command() {
     return 0
   fi
 
+  if command -v pi >/dev/null 2>&1; then
+    printf '%s\n' "$(command -v pi)"
+    return 0
+  fi
+
   local pi_mono_root
   pi_mono_root="$(find_pi_mono_root || true)"
   if [ -n "$pi_mono_root" ]; then
     printf '%s\n' "$pi_mono_root/pi-test.sh"
-    return 0
-  fi
-
-  if command -v pi >/dev/null 2>&1; then
-    printf '%s\n' "$(command -v pi)"
     return 0
   fi
 
