@@ -9,6 +9,7 @@ This document is for **real operational verification**, not mock-only tests.
 - real GitHub auth (`gh auth status` should succeed)
 - tmux installed locally
 - route filters configured for the target repo/session/channel
+- for Pi Layer A verification: Pi installed and available on `PATH`
 
 Recommended environment:
 
@@ -84,6 +85,36 @@ Operational flow:
 6. Launch a session via `clawhip tmux new ...`.
 7. Confirm wrapper registration + keyword/stale delivery.
 
+### Pi Layer A presets
+
+- visible tmux launch path
+- attach / tail workflow
+- keyword detection on Pi session output
+- stale detection on Pi session output
+- optional wrapper `session.*` lifecycle signals
+
+Operational flow:
+
+1. Pick a real working directory for Pi and a stable session name such as `issue-123`.
+2. Launch Pi through `skills/pi/create.sh <session-name> <worktree-path> [prompt] [channel] [mention]`.
+3. Confirm the script reports a visible tmux session and prints the attach command.
+4. Attach with `tmux attach -t <session-name>` and confirm the live Pi session is visible.
+5. Detach and run `skills/pi/tail.sh <session-name>` to confirm recent output can be inspected without attaching.
+6. Trigger or print one monitored keyword in the session output and confirm the `tmux.*` keyword alert arrives in Discord.
+7. Leave the session idle beyond the configured stale threshold and confirm the stale alert arrives in Discord.
+8. If wrapper lifecycle routes are enabled, confirm `session.started` is delivered when the wrapper launches.
+9. End the Pi process and confirm `session.finished` or `session.failed` arrives as expected.
+10. Reattach once more if needed to confirm the operator can understand and recover the session state quickly.
+
+### Pi Layer A verification notes
+
+Treat these checks as the source of truth for the current Pi integration phase:
+
+- the tmux session is the primary live-view surface
+- `tmux.*` alerts are the primary notification path
+- wrapper `session.*` emits are secondary and should not be treated as the main observability layer
+- if keyword wording proves noisy or too weak, adjust Pi keyword defaults based on real transcripts
+
 ## Helper script
 
 A helper script is included:
@@ -102,6 +133,12 @@ Available modes:
 - `tmux-keyword`
 - `tmux-stale`
 - `tmux-wrapper`
+
+Current note for Pi:
+
+- Pi-specific helper modes are not yet added
+- until they exist, verify Pi using the `skills/pi/` wrappers plus the tmux modes above
+- future Pi helper modes should likely include `pi-launch`, `pi-keyword`, `pi-stale`, and `pi-lifecycle`
 
 The script is intentionally conservative: it prints the live workflow and fetches recent Discord messages, but it does not silently mutate production resources without operator intent.
 
