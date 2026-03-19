@@ -367,6 +367,10 @@ Implement the v1 state object with:
 3. idle/stale derivation
 4. optional wrapper-exit enrichment
 
+The file-by-file implementation plan now lives in:
+
+- `docs/pi-session-state-implementation-plan.md`
+
 After that:
 - add blocked/waiting heuristics
 - then evaluate whether auxiliary JSON/RPC enrichment is still needed for missing parity
