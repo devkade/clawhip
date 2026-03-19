@@ -36,7 +36,7 @@ Launch Pi coding sessions with a visible tmux-first workflow and clawhip monitor
 ./create.sh issue-123 ~/my-project/worktrees/issue-123 "Fix the bug in src/main.rs and create a PR to dev" 1234567890 "<@user-id>"
 ```
 
-`create.sh` launches Pi in a clawhip-monitored tmux session. The primary goal is to keep the session directly visible and attachable while clawhip handles keyword/stale alerts and route delivery. The wrapper also emits lightweight `session.started`, `session.finished`, and `session.failed` signals as a secondary notification layer. If you pass a prompt, the script waits 10 seconds for Pi to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
+`create.sh` launches Pi in a clawhip-monitored tmux session. The primary goal is to keep the session directly visible and attachable while clawhip handles keyword/stale alerts and route delivery. The wrapper also emits lightweight `session.started`, `session.finished`, and `session.failed` signals as a secondary notification layer. The launcher auto-detects a `pi-mono` checkout by looking for `pi-test.sh`; otherwise it falls back to `pi` on `PATH`, unless you explicitly set `CLAWHIP_PI_BIN`. If you pass a prompt, the script waits for the configured delay, then sends the prompt via `tmux send-keys -l` before pressing Enter.
 
 ### Send a prompt
 
@@ -60,10 +60,11 @@ Launch Pi coding sessions with a visible tmux-first workflow and clawhip monitor
 |----------|---------|-------------|
 | `CLAWHIP_PI_KEYWORDS` | `error,Error,FAILED,PR created,panic,complete,done` | Comma-separated keywords to monitor |
 | `CLAWHIP_PI_STALE_MIN` | `30` | Minutes before stale alert |
-| `CLAWHIP_PI_FLAGS` | *(empty)* | Extra flags passed to `pi` |
+| `CLAWHIP_PI_FLAGS` | *(empty)* | Extra flags passed to the Pi launcher |
 | `CLAWHIP_PI_ENV` | *(empty)* | Extra env vars prepended to the Pi command |
 | `CLAWHIP_PI_PROJECT` | detected from the git common dir (fallback: worktree name) | Override the project name sent in wrapper lifecycle events |
-| `CLAWHIP_PI_BIN` | `pi` | Override the Pi executable |
+| `CLAWHIP_PI_BIN` | auto-detected (`pi-test.sh` inside `pi-mono`, otherwise `pi` on `PATH`) | Override the Pi launcher explicitly |
+| `CLAWHIP_PI_PROMPT_DELAY` | `10` | Seconds to wait before sending the initial prompt into tmux |
 
 ### Route examples
 
