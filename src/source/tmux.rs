@@ -13,7 +13,7 @@ use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
-use crate::pi_state::{PiActivity, PiConfidence, PiSessionState, unix_now};
+use crate::pi_state::{PiConfidence, PiSessionState, unix_now};
 use crate::pi_state_store::SharedPiStateStore;
 use crate::source::Source;
 
