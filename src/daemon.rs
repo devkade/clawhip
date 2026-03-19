@@ -406,4 +406,32 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
     }
+
+    #[tokio::test]
+    async fn apply_pi_wrapper_event_updates_state_store() {
+        let store = new_shared_pi_state_store();
+        let event = normalize_event(IncomingEvent {
+            kind: "session.failed".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "pi",
+                "session_name": "issue-9",
+                "project": "repo",
+                "repo_path": "/repo",
+                "error_message": "boom",
+            }),
+        });
+
+        apply_pi_wrapper_event_to_state(&store, &event).await;
+
+        let read = store.read().await;
+        let state = read.get("issue-9").expect("state present");
+        assert_eq!(state.tool, "pi");
+        assert_eq!(state.project, "repo");
+        assert_eq!(state.failure_reason.as_deref(), Some("boom"));
+        assert!(state.sources.wrapper_emit);
+    }
 }
