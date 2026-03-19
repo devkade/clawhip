@@ -301,6 +301,7 @@ async fn poll_tmux(
                 )
                 .await?;
                 state.panes.retain(|_, pane| pane.session != *session_name);
+                update_pi_state_on_disappearance(pi_state_store, registration, session_name).await;
                 continue;
             }
             Err(error) => {
@@ -345,14 +346,31 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
+                                let pane_content = pane.content.clone();
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
                                 existing.content_hash = hash;
                                 existing.last_change = now;
                                 existing.last_stale_notification = None;
+                                update_pi_state_on_pane_change(
+                                    pi_state_store,
+                                    registration,
+                                    session_name,
+                                    &pane_content,
+                                )
+                                .await;
                                 Some(hits)
                             } else {
-                                if should_emit_stale(existing, now, registration.stale_minutes) {
+                                let stale = should_emit_stale(existing, now, registration.stale_minutes);
+                                update_pi_state_without_pane_change(
+                                    pi_state_store,
+                                    registration,
+                                    session_name,
+                                    existing.last_change,
+                                    stale,
+                                )
+                                .await;
+                                if stale {
                                     tx.emit(tmux_stale_event(
                                         registration,
                                         existing.session.clone(),
