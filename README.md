@@ -37,6 +37,8 @@ Then OpenClaw should:
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the release architecture that ships in v0.4.0.
 
+For planned Pi integration work, see [`docs/pi-integration-plan.md`](docs/pi-integration-plan.md).
+
 ## Good to use together
 
 clawhip pairs well with coding session tools that run in tmux:
