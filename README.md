@@ -38,6 +38,8 @@ Then OpenClaw should:
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the release architecture that ships in v0.4.0.
 
 For planned Pi integration work, see [`docs/pi-integration-plan.md`](docs/pi-integration-plan.md).
+For Pi architecture context, see [`docs/pi-mono-architecture-notes.md`](docs/pi-mono-architecture-notes.md).
+For the tmux-first visible-session workflow, see [`docs/pi-layer-a-operator-guide.md`](docs/pi-layer-a-operator-guide.md).
 
 ## Good to use together
 
