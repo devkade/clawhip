@@ -272,34 +272,36 @@ async fn poll_tmux(
     let mut sessions_to_unregister = Vec::new();
 
     for (session_name, registration) in &sessions {
-        if registration.active_wrapper_monitor {
-            state.pending_keyword_hits.remove(session_name);
-            continue;
-        }
-
+        let wrapper_monitor = registration.active_wrapper_monitor;
         let now = Instant::now();
-        flush_session_pending_keyword_hits(
-            &mut state.pending_keyword_hits,
-            session_name,
-            registration,
-            tx,
-            now,
-            false,
-        )
-        .await?;
+        if wrapper_monitor {
+            state.pending_keyword_hits.remove(session_name);
+        } else {
+            flush_session_pending_keyword_hits(
+                &mut state.pending_keyword_hits,
+                session_name,
+                registration,
+                tx,
+                now,
+                false,
+            )
+            .await?;
+        }
 
         match session_exists(session_name).await {
             Ok(false) => {
                 sessions_to_unregister.push(session_name.clone());
-                flush_session_pending_keyword_hits(
-                    &mut state.pending_keyword_hits,
-                    session_name,
-                    registration,
-                    tx,
-                    now,
-                    true,
-                )
-                .await?;
+                if !wrapper_monitor {
+                    flush_session_pending_keyword_hits(
+                        &mut state.pending_keyword_hits,
+                        session_name,
+                        registration,
+                        tx,
+                        now,
+                        true,
+                    )
+                    .await?;
+                }
                 state.panes.retain(|_, pane| pane.session != *session_name);
                 update_pi_state_on_disappearance(pi_state_store, registration, session_name).await;
                 continue;
@@ -326,6 +328,7 @@ async fn poll_tmux(
 
                     let hits = match state.panes.get_mut(&pane_key) {
                         None => {
+                            let pane_content = pane.content.clone();
                             state.panes.insert(
                                 pane_key,
                                 TmuxPaneState {
@@ -337,15 +340,26 @@ async fn poll_tmux(
                                     last_stale_notification: None,
                                 },
                             );
+                            update_pi_state_on_pane_change(
+                                pi_state_store,
+                                registration,
+                                session_name,
+                                &pane_content,
+                            )
+                            .await;
                             None
                         }
                         Some(existing) => {
                             if existing.content_hash != hash {
-                                let hits = collect_keyword_hits(
-                                    &existing.snapshot,
-                                    &pane.content,
-                                    &registration.keywords,
-                                );
+                                let hits = if wrapper_monitor {
+                                    Vec::new()
+                                } else {
+                                    collect_keyword_hits(
+                                        &existing.snapshot,
+                                        &pane.content,
+                                        &registration.keywords,
+                                    )
+                                };
                                 let pane_content = pane.content.clone();
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
@@ -371,7 +385,7 @@ async fn poll_tmux(
                                     stale,
                                 )
                                 .await;
-                                if stale {
+                                if stale && !wrapper_monitor {
                                     tx.emit(tmux_stale_event(
                                         registration,
                                         existing.session.clone(),
@@ -386,7 +400,10 @@ async fn poll_tmux(
                         }
                     };
 
-                    if let Some(hits) = hits {
+                    if let Some(hits) = hits
+                        && !wrapper_monitor
+                        && !hits.is_empty()
+                    {
                         push_session_pending_keyword_hits(
                             &mut state.pending_keyword_hits,
                             session_name,
@@ -1219,6 +1236,42 @@ error: failed";
         ));
         assert!(!looks_like_pi_blocked_or_waiting("Running cargo test..."));
         assert!(!looks_like_pi_blocked_or_waiting("Finished writing files"));
+    }
+
+    #[tokio::test]
+    async fn pane_observation_marks_pi_session_running_and_active() {
+        let store = crate::pi_state_store::new_shared_pi_state_store();
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+
+        update_pi_state_on_pane_change(
+            &store,
+            &registration,
+            &registration.session,
+            "Pi is working on the task",
+        )
+        .await;
+
+        let read = store.read().await;
+        let state = read.get(&registration.session).expect("state present");
+        assert!(matches!(
+            state.lifecycle,
+            crate::pi_state::PiLifecycle::Running
+        ));
+        assert!(matches!(
+            state.activity,
+            crate::pi_state::PiActivity::Active
+        ));
+        assert!(state.attachable);
+        assert!(state.sources.pane_observed);
+        assert_eq!(
+            state.last_observed_text.as_deref(),
+            Some("Pi is working on the task")
+        );
     }
 
     #[tokio::test]
