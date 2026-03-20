@@ -551,6 +551,7 @@ mod tests {
             );
             running.mark_running(100);
             running.mark_pane_change(105, "working".into());
+            running.set_tool_state(true, Some("cargo test".into()), None, 106);
             write.insert(running.session_name.clone(), running);
 
             let mut blocked = PiSessionState::new(
@@ -597,6 +598,10 @@ mod tests {
         );
         assert_eq!(
             payload["summary"]["active_cycle_sessions"][0],
+            Value::from("issue-1")
+        );
+        assert_eq!(
+            payload["summary"]["tool_active_sessions"][0],
             Value::from("issue-1")
         );
     }

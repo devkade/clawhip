@@ -468,8 +468,14 @@ async fn update_pi_state_on_pane_change(
             registration.branch.clone(),
         )
     });
+    let last_line = last_nonempty_line(pane_content);
     state.mark_running(now);
-    state.mark_pane_change(now, last_nonempty_line(pane_content));
+    state.mark_pane_change(now, last_line.clone());
+    let tool_hint = infer_pi_tool_hint(&last_line);
+    let tool_error = infer_pi_tool_error(&last_line);
+    if tool_hint.is_some() || tool_error.is_some() {
+        state.set_tool_state(tool_hint.is_some(), tool_hint, tool_error, now);
+    }
 }
 
 async fn update_pi_state_without_pane_change(
