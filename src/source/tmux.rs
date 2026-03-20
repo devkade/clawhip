@@ -142,6 +142,7 @@ struct TmuxPaneState {
 struct PiProjectionMemo {
     blocked_active: bool,
     last_pr_created_key: Option<String>,
+    last_retry_needed_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -364,6 +365,14 @@ async fn poll_tmux(
                                 &pane_content,
                             )
                             .await?;
+                            maybe_emit_pi_retry_needed(
+                                tx,
+                                &mut state.pi_projection,
+                                registration,
+                                session_name,
+                                &pane_content,
+                            )
+                            .await?;
                             clear_pi_blocked_projection(
                                 &mut state.pi_projection,
                                 registration,
@@ -396,6 +405,14 @@ async fn poll_tmux(
                                 )
                                 .await;
                                 maybe_emit_pi_pr_created(
+                                    tx,
+                                    &mut state.pi_projection,
+                                    registration,
+                                    session_name,
+                                    &pane_content,
+                                )
+                                .await?;
+                                maybe_emit_pi_retry_needed(
                                     tx,
                                     &mut state.pi_projection,
                                     registration,
@@ -699,6 +716,12 @@ struct PiPrCreatedEvidence {
     pr_number: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiRetryNeededEvidence {
+    key: String,
+    summary: String,
+}
+
 fn infer_pi_pr_created(pane_content: &str) -> Option<PiPrCreatedEvidence> {
     pane_content.lines().rev().find_map(|line| {
         let trimmed = line.trim();
@@ -726,6 +749,29 @@ fn infer_pi_pr_created(pane_content: &str) -> Option<PiPrCreatedEvidence> {
         } else {
             None
         }
+    })
+}
+
+fn infer_pi_retry_needed(pane_content: &str) -> Option<PiRetryNeededEvidence> {
+    pane_content.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let strong = lower.contains("retry needed")
+            || lower.contains("please retry")
+            || lower.contains("try again")
+            || lower.contains("rerun required")
+            || lower.contains("re-run required")
+            || lower.contains("please rerun")
+            || lower.contains("please re-run");
+
+        strong.then(|| PiRetryNeededEvidence {
+            key: trimmed.to_string(),
+            summary: trimmed.to_string(),
+        })
     })
 }
 
@@ -880,6 +926,39 @@ async fn maybe_emit_pi_pr_created<E: EventEmitter>(
             evidence.summary,
             evidence.pr_url,
             evidence.pr_number,
+        ))
+        .await
+}
+
+async fn maybe_emit_pi_retry_needed<E: EventEmitter>(
+    emitter: &E,
+    projection: &mut HashMap<String, PiProjectionMemo>,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+    pane_content: &str,
+) -> Result<()> {
+    if registration.tool.as_deref() != Some("pi") {
+        return Ok(());
+    }
+
+    let Some(evidence) = infer_pi_retry_needed(pane_content) else {
+        return Ok(());
+    };
+    let memo = projection.entry(session_name.to_string()).or_default();
+    if memo.last_retry_needed_key.as_deref() == Some(evidence.key.as_str()) {
+        return Ok(());
+    }
+
+    memo.last_retry_needed_key = Some(evidence.key.clone());
+    emitter
+        .emit(pi_session_event(
+            registration,
+            "session.retry-needed",
+            session_name,
+            "retry-needed",
+            evidence.summary,
+            None,
+            None,
         ))
         .await
 }
@@ -1498,6 +1577,15 @@ error: failed";
         );
     }
 
+    #[test]
+    fn retry_needed_heuristic_detects_retry_request_lines() {
+        let evidence = infer_pi_retry_needed(
+            "This failed due to flaky infra; please retry once the environment stabilizes.",
+        )
+        .expect("retry evidence");
+        assert!(evidence.summary.contains("please retry"));
+    }
+
     #[tokio::test]
     async fn blocked_projection_emits_once_per_transition() {
         let store = crate::pi_state_store::new_shared_pi_state_store();
@@ -1577,6 +1665,43 @@ error: failed";
         let event = rx.recv().await.expect("pr-created event");
         assert_eq!(event.canonical_kind(), "session.pr-created");
         assert_eq!(event.payload["pr_number"], 71);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_needed_projection_emits_once_per_unique_evidence() {
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut projection = HashMap::new();
+        let pane = "Checks were flaky. Please retry once the runner is healthy.";
+        maybe_emit_pi_retry_needed(
+            &tx,
+            &mut projection,
+            &registration,
+            &registration.session,
+            pane,
+        )
+        .await
+        .unwrap();
+        maybe_emit_pi_retry_needed(
+            &tx,
+            &mut projection,
+            &registration,
+            &registration.session,
+            pane,
+        )
+        .await
+        .unwrap();
+
+        let event = rx.recv().await.expect("retry-needed event");
+        assert_eq!(event.canonical_kind(), "session.retry-needed");
+        assert_eq!(event.payload["status"], "retry-needed");
         assert!(rx.try_recv().is_err());
     }
 

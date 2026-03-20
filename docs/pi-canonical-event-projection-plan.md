@@ -162,6 +162,36 @@ Suggested payload shape:
 }
 ```
 
+##### `session.retry-needed`
+
+Emit when all of the following are true:
+
+- session is identified as `tool = pi`
+- pane output contains strong retry/re-run evidence
+- the evidence is new for that session (deduped)
+
+Accepted strong evidence in this first slice:
+
+- a line containing `retry needed`
+- a line asking to `retry` or `try again`
+- a line asking for a `rerun` or `re-run`
+
+Suggested payload shape:
+
+```json
+{
+  "tool": "pi",
+  "session_name": "issue-123",
+  "session_id": "issue-123",
+  "repo_name": "clawhip",
+  "repo_path": "/path/to/repo",
+  "status": "retry-needed",
+  "summary": "Pi requested a retry or rerun",
+  "mention": "<@user>",
+  "contract_event": "session.retry-needed"
+}
+```
+
 #### 5.3 Dedup policy
 
 Projection must be deduped per session.
