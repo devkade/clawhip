@@ -147,6 +147,8 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
     let mut stale_sessions = Vec::new();
     let mut blocked_sessions = Vec::new();
     let mut running_sessions = Vec::new();
+    let mut tool_error_sessions = Vec::new();
+    let mut tool_hint_counts: HashMap<String, usize> = HashMap::new();
 
     for session in &sessions {
         *lifecycle_counts
@@ -164,6 +166,12 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
         }
         if matches!(session.lifecycle, PiLifecycle::Running) {
             running_sessions.push(session.session_name.clone());
+        }
+        if session.last_tool_error.is_some() {
+            tool_error_sessions.push(session.session_name.clone());
+        }
+        if let Some(hint) = &session.last_tool_hint {
+            *tool_hint_counts.entry(hint.clone()).or_insert(0) += 1;
         }
     }
 
@@ -188,7 +196,10 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
             "blocked_sessions": blocked_sessions,
             "running_sessions": running_sessions,
             "active_cycle_sessions": active_cycle_sessions,
+            "tool_active_count": tool_active_sessions.len(),
             "tool_active_sessions": tool_active_sessions,
+            "tool_error_sessions": tool_error_sessions,
+            "tool_hint_counts": tool_hint_counts,
         },
         "sessions": sessions,
     })
@@ -603,6 +614,11 @@ mod tests {
         assert_eq!(
             payload["summary"]["tool_active_sessions"][0],
             Value::from("issue-1")
+        );
+        assert_eq!(payload["summary"]["tool_active_count"], Value::from(1));
+        assert_eq!(
+            payload["summary"]["tool_hint_counts"]["cargo test"],
+            Value::from(1)
         );
     }
 }
