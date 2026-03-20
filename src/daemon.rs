@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -16,7 +16,7 @@ use crate::config::AppConfig;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, normalize_event};
-use crate::pi_state::{PiConfidence, PiSessionState, unix_now};
+use crate::pi_state::{PiActivity, PiConfidence, PiLifecycle, PiSessionState, unix_now};
 use crate::pi_state_store::{SharedPiStateStore, new_shared_pi_state_store};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
@@ -74,6 +74,8 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let app = AxumRouter::new()
         .route("/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/pi/state", get(pi_state_index))
+        .route("/api/pi/state/{session}", get(pi_state_show))
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
@@ -131,6 +133,86 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     health(State(state)).await
+}
+
+fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
+    sessions.sort_by(|a, b| a.session_name.cmp(&b.session_name));
+
+    let mut lifecycle_counts: HashMap<String, usize> = HashMap::new();
+    let mut activity_counts: HashMap<String, usize> = HashMap::new();
+    let mut stale_sessions = Vec::new();
+    let mut blocked_sessions = Vec::new();
+    let mut running_sessions = Vec::new();
+
+    for session in &sessions {
+        *lifecycle_counts
+            .entry(format!("{:?}", session.lifecycle).to_ascii_lowercase())
+            .or_insert(0) += 1;
+        *activity_counts
+            .entry(format!("{:?}", session.activity).to_ascii_lowercase())
+            .or_insert(0) += 1;
+
+        if session.stale {
+            stale_sessions.push(session.session_name.clone());
+        }
+        if matches!(session.activity, PiActivity::BlockedOrWaiting) {
+            blocked_sessions.push(session.session_name.clone());
+        }
+        if matches!(session.lifecycle, PiLifecycle::Running) {
+            running_sessions.push(session.session_name.clone());
+        }
+    }
+
+    json!({
+        "ok": true,
+        "count": sessions.len(),
+        "summary": {
+            "lifecycle_counts": lifecycle_counts,
+            "activity_counts": activity_counts,
+            "stale_sessions": stale_sessions,
+            "blocked_sessions": blocked_sessions,
+            "running_sessions": running_sessions,
+        },
+        "sessions": sessions,
+    })
+}
+
+async fn pi_state_index(State(state): State<AppState>) -> impl IntoResponse {
+    let read = state.pi_state_store.read().await;
+    let sessions: Vec<_> = read.values().cloned().collect();
+    Json(build_pi_state_index_payload(sessions))
+}
+
+async fn pi_state_show(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+) -> impl IntoResponse {
+    let read = state.pi_state_store.read().await;
+    match read.get(&session) {
+        Some(pi_state) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "summary": {
+                    "session": pi_state.session_name,
+                    "lifecycle": format!("{:?}", pi_state.lifecycle).to_ascii_lowercase(),
+                    "activity": format!("{:?}", pi_state.activity).to_ascii_lowercase(),
+                    "stale": pi_state.stale,
+                    "attachable": pi_state.attachable,
+                },
+                "session_state": pi_state,
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("pi session not found: {session}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn post_event(
@@ -294,7 +376,10 @@ async fn apply_pi_wrapper_event_to_state(store: &SharedPiStateStore, event: &Inc
     }
 
     let kind = event.canonical_kind();
-    if !matches!(kind, "session.started" | "session.finished" | "session.failed") {
+    if !matches!(
+        kind,
+        "session.started" | "session.finished" | "session.failed"
+    ) {
         return;
     }
 
@@ -433,5 +518,42 @@ mod tests {
         assert_eq!(state.project, "repo");
         assert_eq!(state.failure_reason.as_deref(), Some("boom"));
         assert!(state.sources.wrapper_emit);
+    }
+
+    #[tokio::test]
+    async fn pi_state_index_includes_summary_counts() {
+        let store = new_shared_pi_state_store();
+        {
+            let mut write = store.write().await;
+            let mut running = PiSessionState::new(
+                "issue-1".into(),
+                "repo".into(),
+                "/repo".into(),
+                "issue-1".into(),
+                None,
+            );
+            running.mark_running(100);
+            running.mark_blocked_or_waiting(110);
+            write.insert(running.session_name.clone(), running);
+
+            let mut failed = PiSessionState::new(
+                "issue-2".into(),
+                "repo".into(),
+                "/repo".into(),
+                "issue-2".into(),
+                None,
+            );
+            failed.mark_failed(120, Some("boom".into()), None);
+            failed.mark_stale(130);
+            write.insert(failed.session_name.clone(), failed);
+        }
+
+        let read = store.read().await;
+        let payload = build_pi_state_index_payload(read.values().cloned().collect());
+        assert_eq!(payload["count"], Value::from(2));
+        assert_eq!(payload["summary"]["lifecycle_counts"]["running"], Value::from(1));
+        assert_eq!(payload["summary"]["lifecycle_counts"]["failed"], Value::from(1));
+        assert_eq!(payload["summary"]["blocked_sessions"][0], Value::from("issue-1"));
+        assert_eq!(payload["summary"]["stale_sessions"][0], Value::from("issue-2"));
     }
 }
