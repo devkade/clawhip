@@ -172,6 +172,11 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
         .filter(|session| session.cycle_active)
         .map(|session| session.session_name.clone())
         .collect();
+    let tool_active_sessions: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.tool_active)
+        .map(|session| session.session_name.clone())
+        .collect();
 
     json!({
         "ok": true,

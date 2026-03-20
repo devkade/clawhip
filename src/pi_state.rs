@@ -77,6 +77,11 @@ pub struct PiSessionState {
     pub last_prompt_inject_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_observed_text: Option<String>,
+    pub tool_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_error: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -117,6 +122,9 @@ impl PiSessionState {
             last_cycle_ended_at_unix: None,
             last_prompt_inject_at_unix: None,
             last_observed_text: None,
+            tool_active: false,
+            last_tool_hint: None,
+            last_tool_error: None,
             exit_code: None,
             failure_reason: None,
             confidence: PiStateConfidence {
@@ -148,6 +156,7 @@ impl PiSessionState {
         self.start_cycle_if_needed(now);
         self.last_pane_change_at_unix = Some(now);
         self.last_observed_text = Some(text);
+        self.tool_active = false;
         self.activity = PiActivity::Active;
         self.attachable = true;
         self.stale = false;
@@ -211,6 +220,23 @@ impl PiSessionState {
         self.attachable = false;
         self.stale = false;
         self.confidence.lifecycle = PiConfidence::Low;
+        self.touch(now);
+    }
+
+    pub fn set_tool_state(
+        &mut self,
+        active: bool,
+        hint: Option<String>,
+        error: Option<String>,
+        now: u64,
+    ) {
+        self.tool_active = active;
+        if let Some(hint) = hint {
+            self.last_tool_hint = Some(hint);
+        }
+        if let Some(error) = error {
+            self.last_tool_error = Some(error);
+        }
         self.touch(now);
     }
 
@@ -328,5 +354,26 @@ mod tests {
         assert!(state.cycle_active);
         assert_eq!(state.cycle_count, 2);
         assert_eq!(state.current_cycle_started_at_unix, Some(180));
+    }
+
+    #[test]
+    fn tool_state_fields_can_be_recorded() {
+        let mut state = PiSessionState::new(
+            "issue-1".into(),
+            "repo".into(),
+            "/repo".into(),
+            "issue-1".into(),
+            None,
+        );
+        state.set_tool_state(
+            true,
+            Some("cargo test".into()),
+            Some("test failed".into()),
+            220,
+        );
+        assert!(state.tool_active);
+        assert_eq!(state.last_tool_hint.as_deref(), Some("cargo test"));
+        assert_eq!(state.last_tool_error.as_deref(), Some("test failed"));
+        assert_eq!(state.updated_at_unix, 220);
     }
 }
