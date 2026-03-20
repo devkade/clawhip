@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::sleep;
@@ -13,7 +14,7 @@ use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
-use crate::pi_state::{PiConfidence, PiSessionState, unix_now};
+use crate::pi_state::{PiActivity, PiConfidence, PiSessionState, unix_now};
 use crate::pi_state_store::SharedPiStateStore;
 use crate::source::Source;
 
@@ -138,9 +139,16 @@ struct TmuxPaneState {
 }
 
 #[derive(Default)]
+struct PiProjectionMemo {
+    blocked_active: bool,
+    last_pr_created_key: Option<String>,
+}
+
+#[derive(Default)]
 struct TmuxMonitorState {
     panes: HashMap<String, TmuxPaneState>,
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
+    pi_projection: HashMap<String, PiProjectionMemo>,
 }
 
 struct TmuxPaneSnapshot {
@@ -302,6 +310,7 @@ async fn poll_tmux(
                     )
                     .await?;
                 }
+                state.pi_projection.remove(session_name);
                 state.panes.retain(|_, pane| pane.session != *session_name);
                 update_pi_state_on_disappearance(pi_state_store, registration, session_name).await;
                 continue;
@@ -347,6 +356,19 @@ async fn poll_tmux(
                                 &pane_content,
                             )
                             .await;
+                            maybe_emit_pi_pr_created(
+                                tx,
+                                &mut state.pi_projection,
+                                registration,
+                                session_name,
+                                &pane_content,
+                            )
+                            .await?;
+                            clear_pi_blocked_projection(
+                                &mut state.pi_projection,
+                                registration,
+                                session_name,
+                            );
                             None
                         }
                         Some(existing) => {
@@ -373,6 +395,19 @@ async fn poll_tmux(
                                     &pane_content,
                                 )
                                 .await;
+                                maybe_emit_pi_pr_created(
+                                    tx,
+                                    &mut state.pi_projection,
+                                    registration,
+                                    session_name,
+                                    &pane_content,
+                                )
+                                .await?;
+                                clear_pi_blocked_projection(
+                                    &mut state.pi_projection,
+                                    registration,
+                                    session_name,
+                                );
                                 Some(hits)
                             } else {
                                 let stale =
@@ -385,6 +420,14 @@ async fn poll_tmux(
                                     stale,
                                 )
                                 .await;
+                                maybe_emit_pi_blocked(
+                                    tx,
+                                    pi_state_store,
+                                    &mut state.pi_projection,
+                                    registration,
+                                    session_name,
+                                )
+                                .await?;
                                 if stale && !wrapper_monitor {
                                     tx.emit(tmux_stale_event(
                                         registration,
@@ -431,6 +474,9 @@ async fn poll_tmux(
 
     state
         .pending_keyword_hits
+        .retain(|session, _| sessions.contains_key(session));
+    state
+        .pi_projection
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
@@ -643,6 +689,208 @@ fn infer_pi_tool_error(line: &str) -> Option<String> {
         .iter()
         .any(|marker| normalized.contains(marker))
         .then(|| line.trim().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiPrCreatedEvidence {
+    key: String,
+    summary: String,
+    pr_url: Option<String>,
+    pr_number: Option<u64>,
+}
+
+fn infer_pi_pr_created(pane_content: &str) -> Option<PiPrCreatedEvidence> {
+    pane_content.lines().rev().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let pr_url = extract_github_pr_url(trimmed);
+        let pr_number = pr_url
+            .as_deref()
+            .and_then(parse_pr_number_from_url)
+            .or_else(|| parse_pr_number_from_text(trimmed));
+        let strong_phrase = lower.contains("pr created")
+            || lower.contains("pull request created")
+            || lower.contains("created pull request");
+
+        if pr_url.is_some() || strong_phrase {
+            Some(PiPrCreatedEvidence {
+                key: pr_url.clone().unwrap_or_else(|| trimmed.to_string()),
+                summary: trimmed.to_string(),
+                pr_url,
+                pr_number,
+            })
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_github_pr_url(line: &str) -> Option<String> {
+    let start = line.find("https://github.com/")?;
+    let tail = &line[start..];
+    let url = tail
+        .split_whitespace()
+        .next()?
+        .trim_end_matches([',', ')', ']', '.']);
+    url.contains("/pull/").then(|| url.to_string())
+}
+
+fn parse_pr_number_from_url(url: &str) -> Option<u64> {
+    let number = url.rsplit('/').next()?;
+    number.parse::<u64>().ok()
+}
+
+fn parse_pr_number_from_text(line: &str) -> Option<u64> {
+    let lower = line.to_ascii_lowercase();
+    let marker = lower.find("pr #")?;
+    let digits = lower[marker + 4..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+}
+
+fn pi_session_event(
+    registration: &RegisteredTmuxSession,
+    kind: &str,
+    session_name: &str,
+    status: &str,
+    summary: String,
+    pr_url: Option<String>,
+    pr_number: Option<u64>,
+) -> IncomingEvent {
+    let mut payload = json!({
+        "tool": "pi",
+        "session_name": session_name,
+        "session_id": session_name,
+        "repo_name": registration.project.clone().unwrap_or_else(|| session_name.to_string()),
+        "repo_path": registration.repo_path.clone().unwrap_or_default(),
+        "status": status,
+        "summary": summary,
+        "contract_event": kind,
+        "mention": registration.mention.clone(),
+    });
+
+    if let Some(branch) = &registration.branch {
+        payload["branch"] = json!(branch);
+    }
+    if let Some(pr_url) = pr_url {
+        payload["pr_url"] = json!(pr_url);
+    }
+    if let Some(pr_number) = pr_number {
+        payload["pr_number"] = json!(pr_number);
+    }
+
+    IncomingEvent {
+        kind: kind.to_string(),
+        channel: registration.channel.clone(),
+        mention: registration.mention.clone(),
+        format: registration.format.clone(),
+        template: None,
+        payload,
+    }
+}
+
+fn clear_pi_blocked_projection(
+    projection: &mut HashMap<String, PiProjectionMemo>,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+) {
+    if registration.tool.as_deref() != Some("pi") {
+        return;
+    }
+    projection
+        .entry(session_name.to_string())
+        .or_default()
+        .blocked_active = false;
+}
+
+async fn maybe_emit_pi_blocked<E: EventEmitter>(
+    emitter: &E,
+    store: &SharedPiStateStore,
+    projection: &mut HashMap<String, PiProjectionMemo>,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+) -> Result<()> {
+    if registration.tool.as_deref() != Some("pi") {
+        return Ok(());
+    }
+
+    let Some((activity, summary)) = current_pi_activity(store, session_name).await else {
+        return Ok(());
+    };
+    let memo = projection.entry(session_name.to_string()).or_default();
+
+    if activity == PiActivity::BlockedOrWaiting {
+        if !memo.blocked_active {
+            memo.blocked_active = true;
+            emitter
+                .emit(pi_session_event(
+                    registration,
+                    "session.blocked",
+                    session_name,
+                    "blocked",
+                    summary.unwrap_or_else(|| {
+                        "Pi appears to be waiting for operator input".to_string()
+                    }),
+                    None,
+                    None,
+                ))
+                .await?;
+        }
+    } else {
+        memo.blocked_active = false;
+    }
+
+    Ok(())
+}
+
+async fn maybe_emit_pi_pr_created<E: EventEmitter>(
+    emitter: &E,
+    projection: &mut HashMap<String, PiProjectionMemo>,
+    registration: &RegisteredTmuxSession,
+    session_name: &str,
+    pane_content: &str,
+) -> Result<()> {
+    if registration.tool.as_deref() != Some("pi") {
+        return Ok(());
+    }
+
+    let Some(evidence) = infer_pi_pr_created(pane_content) else {
+        return Ok(());
+    };
+    let memo = projection.entry(session_name.to_string()).or_default();
+    if memo.last_pr_created_key.as_deref() == Some(evidence.key.as_str()) {
+        return Ok(());
+    }
+
+    memo.last_pr_created_key = Some(evidence.key.clone());
+    emitter
+        .emit(pi_session_event(
+            registration,
+            "session.pr-created",
+            session_name,
+            "pr-created",
+            evidence.summary,
+            evidence.pr_url,
+            evidence.pr_number,
+        ))
+        .await
+}
+
+async fn current_pi_activity(
+    store: &SharedPiStateStore,
+    session_name: &str,
+) -> Option<(PiActivity, Option<String>)> {
+    let read = store.read().await;
+    let state = read.get(session_name)?;
+    Some((state.activity, state.last_observed_text.clone()))
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -1236,6 +1484,100 @@ error: failed";
         ));
         assert!(!looks_like_pi_blocked_or_waiting("Running cargo test..."));
         assert!(!looks_like_pi_blocked_or_waiting("Finished writing files"));
+    }
+
+    #[test]
+    fn pr_created_heuristic_detects_github_pull_urls() {
+        let evidence =
+            infer_pi_pr_created("Created pull request: https://github.com/acme/clawhip/pull/71")
+                .expect("pr evidence");
+        assert_eq!(evidence.pr_number, Some(71));
+        assert_eq!(
+            evidence.pr_url.as_deref(),
+            Some("https://github.com/acme/clawhip/pull/71")
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_projection_emits_once_per_transition() {
+        let store = crate::pi_state_store::new_shared_pi_state_store();
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+        ensure_pi_state_exists(&store, &registration, &registration.session).await;
+        {
+            let mut write = store.write().await;
+            let state = write.get_mut(&registration.session).expect("state present");
+            state.mark_running(100);
+            state.last_observed_text = Some("Waiting for input from user".into());
+            state.mark_blocked_or_waiting(120);
+        }
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut projection = HashMap::new();
+        maybe_emit_pi_blocked(
+            &tx,
+            &store,
+            &mut projection,
+            &registration,
+            &registration.session,
+        )
+        .await
+        .unwrap();
+        maybe_emit_pi_blocked(
+            &tx,
+            &store,
+            &mut projection,
+            &registration,
+            &registration.session,
+        )
+        .await
+        .unwrap();
+
+        let event = rx.recv().await.expect("blocked event");
+        assert_eq!(event.canonical_kind(), "session.blocked");
+        assert_eq!(event.payload["status"], "blocked");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pr_created_projection_emits_once_per_unique_evidence() {
+        let registration = RegisteredTmuxSession {
+            tool: Some("pi".into()),
+            project: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            ..registration(vec!["error"])
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut projection = HashMap::new();
+        let pane = "Created pull request: https://github.com/acme/clawhip/pull/71";
+        maybe_emit_pi_pr_created(
+            &tx,
+            &mut projection,
+            &registration,
+            &registration.session,
+            pane,
+        )
+        .await
+        .unwrap();
+        maybe_emit_pi_pr_created(
+            &tx,
+            &mut projection,
+            &registration,
+            &registration.session,
+            pane,
+        )
+        .await
+        .unwrap();
+
+        let event = rx.recv().await.expect("pr-created event");
+        assert_eq!(event.canonical_kind(), "session.pr-created");
+        assert_eq!(event.payload["pr_number"], 71);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
