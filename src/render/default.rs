@@ -663,3 +663,29 @@ impl ValueExt for Value {
             .ok_or_else(|| format!("missing integer field '{key}'").into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn renders_pi_state_summary_compact() {
+        let payload = json!({
+            "count": 3,
+            "summary": {
+                "lifecycle_counts": {"running": 2, "failed": 1, "aborted": 0},
+                "blocked_sessions": ["issue-3"],
+                "stale_sessions": ["issue-2"],
+                "tool_active_count": 1,
+                "active_cycle_sessions": ["issue-1"]
+            }
+        });
+
+        let rendered = render_pi_state_summary(&payload, &MessageFormat::Compact).unwrap();
+        assert!(rendered.contains("Pi sessions=3"));
+        assert!(rendered.contains("running=2"));
+        assert!(rendered.contains("blocked=1"));
+        assert!(rendered.contains("tool-active=1"));
+    }
+}

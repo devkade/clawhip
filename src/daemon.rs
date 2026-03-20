@@ -642,6 +642,7 @@ mod tests {
             );
             failed.mark_failed(120, Some("boom".into()), None);
             failed.mark_stale(130);
+            failed.set_tool_state(false, None, Some("boom".into()), 131);
             write.insert(failed.session_name.clone(), failed);
         }
 
@@ -677,5 +678,6 @@ mod tests {
             payload["summary"]["tool_hint_counts"]["cargo test"],
             Value::from(1)
         );
+        assert_eq!(payload["summary"]["tool_error_sessions"].as_array().unwrap().len(), 1);
     }
 }
