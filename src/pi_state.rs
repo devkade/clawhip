@@ -62,11 +62,17 @@ pub struct PiSessionState {
     pub activity: PiActivity,
     pub stale: bool,
     pub attachable: bool,
+    pub cycle_count: u64,
+    pub cycle_active: bool,
 
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_pane_change_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_cycle_started_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cycle_ended_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_prompt_inject_at_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,9 +108,13 @@ impl PiSessionState {
             activity: PiActivity::Unknown,
             stale: false,
             attachable: true,
+            cycle_count: 0,
+            cycle_active: false,
             created_at_unix: now,
             updated_at_unix: now,
             last_pane_change_at_unix: None,
+            current_cycle_started_at_unix: None,
+            last_cycle_ended_at_unix: None,
             last_prompt_inject_at_unix: None,
             last_observed_text: None,
             exit_code: None,
@@ -135,6 +145,7 @@ impl PiSessionState {
     }
 
     pub fn mark_pane_change(&mut self, now: u64, text: String) {
+        self.start_cycle_if_needed(now);
         self.last_pane_change_at_unix = Some(now);
         self.last_observed_text = Some(text);
         self.activity = PiActivity::Active;
@@ -151,23 +162,27 @@ impl PiSessionState {
     }
 
     pub fn mark_idle(&mut self, now: u64) {
+        self.end_cycle(now);
         self.activity = PiActivity::Idle;
         self.confidence.activity = PiConfidence::Low;
         self.touch(now);
     }
 
     pub fn mark_blocked_or_waiting(&mut self, now: u64) {
+        self.end_cycle(now);
         self.activity = PiActivity::BlockedOrWaiting;
         self.confidence.activity = PiConfidence::Low;
         self.touch(now);
     }
 
     pub fn mark_stale(&mut self, now: u64) {
+        self.end_cycle(now);
         self.stale = true;
         self.touch(now);
     }
 
     pub fn mark_finished(&mut self, now: u64, exit_code: Option<i32>) {
+        self.end_cycle(now);
         self.lifecycle = PiLifecycle::Finished;
         self.activity = PiActivity::Unknown;
         self.attachable = false;
@@ -178,6 +193,7 @@ impl PiSessionState {
     }
 
     pub fn mark_failed(&mut self, now: u64, reason: Option<String>, exit_code: Option<i32>) {
+        self.end_cycle(now);
         self.lifecycle = PiLifecycle::Failed;
         self.activity = PiActivity::Unknown;
         self.attachable = false;
@@ -189,12 +205,29 @@ impl PiSessionState {
     }
 
     pub fn mark_aborted(&mut self, now: u64) {
+        self.end_cycle(now);
         self.lifecycle = PiLifecycle::Aborted;
         self.activity = PiActivity::Unknown;
         self.attachable = false;
         self.stale = false;
         self.confidence.lifecycle = PiConfidence::Low;
         self.touch(now);
+    }
+
+    fn start_cycle_if_needed(&mut self, now: u64) {
+        if !self.cycle_active {
+            self.cycle_active = true;
+            self.cycle_count += 1;
+            self.current_cycle_started_at_unix = Some(now);
+        }
+    }
+
+    fn end_cycle(&mut self, now: u64) {
+        if self.cycle_active {
+            self.cycle_active = false;
+            self.last_cycle_ended_at_unix = Some(now);
+            self.current_cycle_started_at_unix = None;
+        }
     }
 }
 
@@ -256,5 +289,44 @@ mod tests {
         assert_eq!(state.lifecycle, PiLifecycle::Running);
         assert_eq!(state.activity, PiActivity::BlockedOrWaiting);
         assert_eq!(state.confidence.activity, PiConfidence::Low);
+    }
+
+    #[test]
+    fn pane_changes_start_cycle_and_idle_ends_it() {
+        let mut state = PiSessionState::new(
+            "issue-1".into(),
+            "repo".into(),
+            "/repo".into(),
+            "issue-1".into(),
+            None,
+        );
+        state.mark_running(100);
+        state.mark_pane_change(120, "working".into());
+        assert!(state.cycle_active);
+        assert_eq!(state.cycle_count, 1);
+        assert_eq!(state.current_cycle_started_at_unix, Some(120));
+
+        state.mark_idle(160);
+        assert!(!state.cycle_active);
+        assert_eq!(state.last_cycle_ended_at_unix, Some(160));
+        assert_eq!(state.current_cycle_started_at_unix, None);
+    }
+
+    #[test]
+    fn new_activity_after_end_starts_new_cycle() {
+        let mut state = PiSessionState::new(
+            "issue-1".into(),
+            "repo".into(),
+            "/repo".into(),
+            "issue-1".into(),
+            None,
+        );
+        state.mark_running(100);
+        state.mark_pane_change(120, "first burst".into());
+        state.mark_idle(150);
+        state.mark_pane_change(180, "second burst".into());
+        assert!(state.cycle_active);
+        assert_eq!(state.cycle_count, 2);
+        assert_eq!(state.current_cycle_started_at_unix, Some(180));
     }
 }

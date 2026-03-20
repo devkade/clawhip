@@ -114,7 +114,11 @@ where
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
-    Json(health_payload(state.config.as_ref(), state.port, registered))
+    Json(health_payload(
+        state.config.as_ref(),
+        state.port,
+        registered,
+    ))
 }
 
 fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize) -> Value {
@@ -163,6 +167,12 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
         }
     }
 
+    let active_cycle_sessions: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.cycle_active)
+        .map(|session| session.session_name.clone())
+        .collect();
+
     json!({
         "ok": true,
         "count": sessions.len(),
@@ -172,6 +182,7 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
             "stale_sessions": stale_sessions,
             "blocked_sessions": blocked_sessions,
             "running_sessions": running_sessions,
+            "active_cycle_sessions": active_cycle_sessions,
         },
         "sessions": sessions,
     })
@@ -533,8 +544,19 @@ mod tests {
                 None,
             );
             running.mark_running(100);
-            running.mark_blocked_or_waiting(110);
+            running.mark_pane_change(105, "working".into());
             write.insert(running.session_name.clone(), running);
+
+            let mut blocked = PiSessionState::new(
+                "issue-3".into(),
+                "repo".into(),
+                "/repo".into(),
+                "issue-3".into(),
+                None,
+            );
+            blocked.mark_running(106);
+            blocked.mark_blocked_or_waiting(110);
+            write.insert(blocked.session_name.clone(), blocked);
 
             let mut failed = PiSessionState::new(
                 "issue-2".into(),
@@ -550,10 +572,26 @@ mod tests {
 
         let read = store.read().await;
         let payload = build_pi_state_index_payload(read.values().cloned().collect());
-        assert_eq!(payload["count"], Value::from(2));
-        assert_eq!(payload["summary"]["lifecycle_counts"]["running"], Value::from(1));
-        assert_eq!(payload["summary"]["lifecycle_counts"]["failed"], Value::from(1));
-        assert_eq!(payload["summary"]["blocked_sessions"][0], Value::from("issue-1"));
-        assert_eq!(payload["summary"]["stale_sessions"][0], Value::from("issue-2"));
+        assert_eq!(payload["count"], Value::from(3));
+        assert_eq!(
+            payload["summary"]["lifecycle_counts"]["running"],
+            Value::from(2)
+        );
+        assert_eq!(
+            payload["summary"]["lifecycle_counts"]["failed"],
+            Value::from(1)
+        );
+        assert_eq!(
+            payload["summary"]["blocked_sessions"][0],
+            Value::from("issue-3")
+        );
+        assert_eq!(
+            payload["summary"]["stale_sessions"][0],
+            Value::from("issue-2")
+        );
+        assert_eq!(
+            payload["summary"]["active_cycle_sessions"][0],
+            Value::from("issue-1")
+        );
     }
 }
