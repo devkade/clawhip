@@ -188,6 +188,7 @@ fn build_pi_state_index_payload(mut sessions: Vec<PiSessionState>) -> Value {
             "blocked_sessions": blocked_sessions,
             "running_sessions": running_sessions,
             "active_cycle_sessions": active_cycle_sessions,
+            "tool_active_sessions": tool_active_sessions,
         },
         "sessions": sessions,
     })

@@ -494,6 +494,7 @@ async fn update_pi_state_without_pane_change(
     state.touch(now);
     if stale {
         state.mark_stale(now);
+        state.set_tool_state(false, None, None, now);
     } else if last_change.elapsed() >= Duration::from_secs(120) {
         let last_line = state.last_observed_text.clone().unwrap_or_default();
         if looks_like_pi_blocked_or_waiting(&last_line) {
@@ -501,6 +502,7 @@ async fn update_pi_state_without_pane_change(
         } else {
             state.mark_idle(now);
         }
+        state.set_tool_state(false, None, None, now);
     }
 }
 
@@ -580,6 +582,44 @@ fn looks_like_pi_blocked_or_waiting(line: &str) -> bool {
         && question_markers
             .iter()
             .any(|marker| normalized.contains(marker))
+}
+
+fn infer_pi_tool_hint(line: &str) -> Option<String> {
+    let normalized = line.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let tool_markers = [
+        ("cargo ", "cargo"),
+        ("cargo-", "cargo"),
+        ("git ", "git"),
+        ("gh ", "gh"),
+        ("python ", "python"),
+        ("python3 ", "python3"),
+        ("node ", "node"),
+        ("npm ", "npm"),
+        ("pnpm ", "pnpm"),
+        ("yarn ", "yarn"),
+        ("bash ", "bash"),
+        ("sh ", "sh"),
+        ("pytest", "pytest"),
+        ("jest", "jest"),
+        ("vitest", "vitest"),
+        ("go test", "go test"),
+    ];
+    tool_markers
+        .iter()
+        .find_map(|(needle, name)| normalized.contains(needle).then(|| (*name).to_string()))
+}
+
+fn infer_pi_tool_error(line: &str) -> Option<String> {
+    let normalized = line.trim().to_ascii_lowercase();
+    let error_markers = ["error:", "failed", "panic", "exception", "traceback"];
+    error_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        .then(|| line.trim().to_string())
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -1227,5 +1267,32 @@ error: failed";
             crate::pi_state::PiLifecycle::Failed
         ));
         assert_eq!(state.failure_reason.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn tool_hint_heuristic_detects_conservative_visible_tools() {
+        assert_eq!(
+            infer_pi_tool_hint("running cargo test --quiet"),
+            Some("cargo".into())
+        );
+        assert_eq!(infer_pi_tool_hint("gh pr create --fill"), Some("gh".into()));
+        assert_eq!(
+            infer_pi_tool_hint("python3 script.py"),
+            Some("python3".into())
+        );
+        assert_eq!(infer_pi_tool_hint("Finished writing files"), None);
+    }
+
+    #[test]
+    fn tool_error_heuristic_detects_error_like_lines() {
+        assert_eq!(
+            infer_pi_tool_error("error: test failed"),
+            Some("error: test failed".into())
+        );
+        assert_eq!(
+            infer_pi_tool_error("Traceback (most recent call last):"),
+            Some("Traceback (most recent call last):".into())
+        );
+        assert_eq!(infer_pi_tool_error("all good"), None);
     }
 }
