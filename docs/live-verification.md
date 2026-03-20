@@ -136,9 +136,10 @@ Available modes:
 
 Current note for Pi:
 
-- Pi-specific helper modes are not yet added
-- until they exist, verify Pi using the `skills/pi/` wrappers plus the tmux modes above
-- future Pi helper modes should likely include `pi-launch`, `pi-keyword`, `pi-stale`, and `pi-lifecycle`
+- a local Pi helper mode now exists: `pi-local`
+- use it for local daemon + tmux/TUI/state/render verification
+- it validates the local Pi state/debug surfaces, not Discord delivery
+- additional future helper modes may still split `pi-keyword`, `pi-stale`, and `pi-lifecycle` more explicitly
 
 The script is intentionally conservative: it prints the live workflow and fetches recent Discord messages, but it does not silently mutate production resources without operator intent.
 

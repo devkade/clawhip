@@ -12,6 +12,7 @@ Usage:
   scripts/live-verify-default-presets.sh tmux-keyword
   scripts/live-verify-default-presets.sh tmux-stale
   scripts/live-verify-default-presets.sh tmux-wrapper
+  scripts/live-verify-default-presets.sh pi-local
 
 Required env vars for GitHub/Discord verification:
   CLAWHIP_REPO           e.g. Yeachan-Heo/clawhip
@@ -20,6 +21,12 @@ Required env vars for GitHub/Discord verification:
   CLAWHIP_DAEMON_URL     e.g. http://127.0.0.1:25294
 Optional:
   CLAWHIP_MENTION        mention tag to assert in messages
+
+Local Pi verification env vars:
+  CLAWHIP_DAEMON_URL     e.g. http://127.0.0.1:25294
+  PI_WORKDIR             e.g. ~/projects/pi-mono/packages/coding-agent
+  CLAWHIP_BIN            optional explicit clawhip launcher path/script
+  CLAWHIP_PI_BIN         optional explicit pi launcher path
 USAGE
 }
 
@@ -91,15 +98,37 @@ case "$mode" in
     require_common
     echo "Run clawhip tmux new ... with keywords/mention/channel and verify wrapper-generated delivery in Discord."
     ;;
+  pi-local)
+    : "${CLAWHIP_DAEMON_URL:?set CLAWHIP_DAEMON_URL}"
+    : "${PI_WORKDIR:?set PI_WORKDIR}"
+    session="pi-verify-$(date +%s)"
+    repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+    echo "Launching Pi local validation session: $session"
+    (
+      cd "$repo_root/skills/pi"
+      ./create.sh "$session" "$PI_WORKDIR"
+    )
+    sleep 5
+    echo
+    echo "GET $CLAWHIP_DAEMON_URL/api/pi/state"
+    curl -fsS "$CLAWHIP_DAEMON_URL/api/pi/state"
+    echo
+    echo
+    echo "GET $CLAWHIP_DAEMON_URL/api/pi/render-summary/compact"
+    curl -fsS "$CLAWHIP_DAEMON_URL/api/pi/render-summary/compact"
+    echo
+    ;;
   *)
     usage
     exit 1
     ;;
 esac
 
-echo
-echo "Recent Discord messages for channel $CLAWHIP_CHANNEL:"
-fetch_messages | python3 -c 'import json,sys; msgs=json.load(sys.stdin); print(json.dumps(msgs[:5], indent=2)[:4000])'
+if [[ "$mode" != "pi-local" ]]; then
+  echo
+  echo "Recent Discord messages for channel $CLAWHIP_CHANNEL:"
+  fetch_messages | python3 -c 'import json,sys; msgs=json.load(sys.stdin); print(json.dumps(msgs[:5], indent=2)[:4000])'
 
-echo
-echo "To assert a concrete message after performing the live action, pipe the same message list into assert_message_contains manually or extend this script with an operation-specific needle."
+  echo
+  echo "To assert a concrete message after performing the live action, pipe the same message list into assert_message_contains manually or extend this script with an operation-specific needle."
+fi
