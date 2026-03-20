@@ -15,7 +15,7 @@ use crate::VERSION;
 use crate::config::AppConfig;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
-use crate::events::{IncomingEvent, normalize_event};
+use crate::events::{IncomingEvent, MessageFormat, normalize_event};
 use crate::pi_state::{PiActivity, PiConfidence, PiLifecycle, PiSessionState, unix_now};
 use crate::pi_state_store::{SharedPiStateStore, new_shared_pi_state_store};
 use crate::render::{DefaultRenderer, Renderer};
@@ -76,6 +76,8 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         .route("/api/status", get(status))
         .route("/api/pi/state", get(pi_state_index))
         .route("/api/pi/state/{session}", get(pi_state_show))
+        .route("/api/pi/render-summary", get(pi_render_summary_compact))
+        .route("/api/pi/render-summary/{format}", get(pi_render_summary))
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
@@ -240,6 +242,61 @@ async fn pi_state_show(
             })),
         )
             .into_response(),
+    }
+}
+
+async fn pi_render_summary_compact(State(state): State<AppState>) -> impl IntoResponse {
+    render_pi_summary_response(&state, MessageFormat::Compact)
+        .await
+        .into_response()
+}
+
+async fn pi_render_summary(
+    State(state): State<AppState>,
+    Path(format): Path<String>,
+) -> impl IntoResponse {
+    match MessageFormat::from_label(&format) {
+        Ok(format) => render_pi_summary_response(&state, format)
+            .await
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn render_pi_summary_response(
+    state: &AppState,
+    format: MessageFormat,
+) -> (StatusCode, Json<Value>) {
+    let read = state.pi_state_store.read().await;
+    let payload = build_pi_state_index_payload(read.values().cloned().collect());
+    let renderer = DefaultRenderer;
+    let event = IncomingEvent {
+        kind: "pi.state-summary".into(),
+        channel: None,
+        mention: None,
+        format: Some(format.clone()),
+        template: None,
+        payload: payload.clone(),
+    };
+
+    match renderer.render(&event, &format) {
+        Ok(rendered) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "format": format.as_str(),
+                "rendered": rendered,
+                "payload": payload,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        ),
     }
 }
 

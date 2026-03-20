@@ -11,6 +11,9 @@ pub struct DefaultRenderer;
 impl Renderer for DefaultRenderer {
     fn render(&self, event: &IncomingEvent, format: &MessageFormat) -> Result<String> {
         let payload = &event.payload;
+        if event.canonical_kind() == "pi.state-summary" {
+            return render_pi_state_summary(payload, format);
+        }
         if event.canonical_kind().starts_with("session.") {
             return render_session_event(event.canonical_kind(), payload, format);
         }
@@ -501,6 +504,52 @@ fn github_ci_target(payload: &Value) -> Result<String> {
 
 fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
+}
+
+fn render_pi_state_summary(payload: &Value, format: &MessageFormat) -> Result<String> {
+    let count = payload.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let running = payload
+        .pointer("/summary/lifecycle_counts/running")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let failed = payload
+        .pointer("/summary/lifecycle_counts/failed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let aborted = payload
+        .pointer("/summary/lifecycle_counts/aborted")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let blocked = payload
+        .pointer("/summary/blocked_sessions")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let stale = payload
+        .pointer("/summary/stale_sessions")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let tool_active = payload
+        .pointer("/summary/tool_active_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let active_cycles = payload
+        .pointer("/summary/active_cycle_sessions")
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let base = format!(
+        "Pi sessions={} · running={} · blocked={} · stale={} · tool-active={} · cycles={} · failed={} · aborted={}",
+        count, running, blocked, stale, tool_active, active_cycles, failed, aborted
+    );
+
+    Ok(match format {
+        MessageFormat::Compact | MessageFormat::Inline => base,
+        MessageFormat::Alert => format!("🚨 {}", base),
+        MessageFormat::Raw => serde_json::to_string_pretty(payload)?,
+    })
 }
 
 fn render_aggregated_git_commit(payload: &Value, format: &MessageFormat) -> Result<Option<String>> {
