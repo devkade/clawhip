@@ -1,3 +1,0 @@
-name = "pi"
-description = "Shell bridge placeholder for future Pi-native structured integrations"
-bridge = "bridge.sh"

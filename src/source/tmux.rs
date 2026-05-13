@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
@@ -14,11 +13,13 @@ use crate::Result;
 use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
-use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
-use crate::pi_state::{PiActivity, PiConfidence, PiSessionState, unix_now};
-use crate::pi_state_store::SharedPiStateStore;
+use crate::keyword_window::{
+    KeywordHit, KeywordMatchProvenance, KeywordMatchSource, PendingKeywordHits,
+    collect_keyword_hits_with_provenance,
+};
 use crate::router::glob_match;
 use crate::source::Source;
+use crate::telemetry;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
 
@@ -92,20 +93,11 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
 pub struct TmuxSource {
     config: Arc<AppConfig>,
     registry: SharedTmuxRegistry,
-    pi_state_store: SharedPiStateStore,
 }
 
 impl TmuxSource {
-    pub fn new(
-        config: Arc<AppConfig>,
-        registry: SharedTmuxRegistry,
-        pi_state_store: SharedPiStateStore,
-    ) -> Self {
-        Self {
-            config,
-            registry,
-            pi_state_store,
-        }
+    pub fn new(config: Arc<AppConfig>, registry: SharedTmuxRegistry) -> Self {
+        Self { config, registry }
     }
 }
 
@@ -119,14 +111,7 @@ impl Source for TmuxSource {
         let mut state = TmuxMonitorState::default();
 
         loop {
-            poll_tmux(
-                self.config.as_ref(),
-                &self.registry,
-                &self.pi_state_store,
-                &tx,
-                &mut state,
-            )
-            .await?;
+            poll_tmux(self.config.as_ref(), &self.registry, &tx, &mut state).await?;
             sleep(Duration::from_secs(
                 self.config.monitors.poll_interval_secs.max(1),
             ))
@@ -167,17 +152,9 @@ struct TmuxPaneState {
 }
 
 #[derive(Default)]
-struct PiProjectionMemo {
-    blocked_active: bool,
-    last_pr_created_key: Option<String>,
-    last_retry_needed_key: Option<String>,
-}
-
-#[derive(Default)]
 struct TmuxMonitorState {
     panes: HashMap<String, TmuxPaneState>,
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
-    pi_projection: HashMap<String, PiProjectionMemo>,
 }
 
 struct TmuxPaneSnapshot {
@@ -250,10 +227,16 @@ pub async fn monitor_registered_session(
                 Some(existing) => {
                     existing.pane_dead = pane.pane_dead;
                     if existing.content_hash != hash {
-                        let hits = collect_keyword_hits(
+                        let hits = collect_keyword_hits_with_provenance(
                             &existing.snapshot,
                             &pane.content,
                             &registration.keywords,
+                            KeywordMatchProvenance {
+                                pane_id: pane.pane_id.clone(),
+                                pane_name: pane.pane_name.clone(),
+                                cursor: None,
+                                source: KeywordMatchSource::FreshOutput,
+                            },
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
@@ -294,6 +277,12 @@ pub async fn list_active_tmux_registrations(
             sync_active_config_registrations(config, registry, &available_sessions).await;
         }
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                None,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source tmux list-sessions failed: {error}");
         }
     }
@@ -305,13 +294,18 @@ pub async fn list_active_tmux_registrations(
 async fn poll_tmux(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
-    pi_state_store: &SharedPiStateStore,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
     let available_sessions = match list_tmux_sessions().await {
         Ok(sessions) => Some(sessions),
         Err(error) => {
+            telemetry::emit(source_record(
+                telemetry::event_name::SOURCE_DEGRADED,
+                "source_poll_failed",
+                None,
+                Some(error.to_string()),
+            ));
             eprintln!("clawhip source tmux list-sessions failed: {error}");
             None
         }
@@ -339,7 +333,6 @@ async fn poll_tmux(
     for (session_name, registration) in &sessions {
         if registration.active_wrapper_monitor {
             state.pending_keyword_hits.remove(session_name);
-            state.pi_projection.remove(session_name);
             continue;
         }
 
@@ -356,6 +349,12 @@ async fn poll_tmux(
 
         match session_exists(session_name).await {
             Ok(false) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_INVENTORY,
+                    "source_missing",
+                    Some(session_name),
+                    None,
+                ));
                 sessions_to_unregister.push(session_name.clone());
                 flush_session_pending_keyword_hits(
                     &mut state.pending_keyword_hits,
@@ -367,11 +366,15 @@ async fn poll_tmux(
                 )
                 .await?;
                 state.panes.retain(|_, pane| pane.session != *session_name);
-                state.pi_projection.remove(session_name);
-                update_pi_state_on_disappearance(pi_state_store, registration, session_name).await;
                 continue;
             }
             Err(error) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_poll_failed",
+                    Some(session_name),
+                    Some(error.to_string()),
+                ));
                 eprintln!(
                     "clawhip source tmux has-session failed for {}: {error}",
                     session_name
@@ -383,7 +386,6 @@ async fn poll_tmux(
 
         match snapshot_tmux_session(session_name).await {
             Ok(panes) => {
-                ensure_pi_state_exists(pi_state_store, registration, session_name).await;
                 for pane in panes {
                     let pane_key = format!("{}::{}", pane.session, pane.pane_id);
                     active_panes.insert(pane_key.clone());
@@ -398,103 +400,43 @@ async fn poll_tmux(
                                 TmuxPaneState {
                                     session: pane.session,
                                     pane_name: pane.pane_name,
-                                    snapshot: pane.content.clone(),
+                                    snapshot: pane.content,
                                     content_hash: hash,
                                     last_change: now,
                                     last_stale_notification: None,
                                     pane_dead: pane.pane_dead,
                                 },
                             );
-                            update_pi_state_on_pane_change(
-                                pi_state_store,
-                                registration,
-                                session_name,
-                                &pane.content,
-                            )
-                            .await;
-                            maybe_emit_pi_pr_created(
-                                tx,
-                                &mut state.pi_projection,
-                                registration,
-                                session_name,
-                                &pane.content,
-                            )
-                            .await?;
-                            maybe_emit_pi_retry_needed(
-                                tx,
-                                &mut state.pi_projection,
-                                registration,
-                                session_name,
-                                &pane.content,
-                            )
-                            .await?;
-                            clear_pi_blocked_projection(
-                                &mut state.pi_projection,
-                                registration,
-                                session_name,
-                            );
                             None
                         }
                         Some(existing) => {
                             existing.pane_dead = pane.pane_dead;
                             if existing.content_hash != hash {
-                                let hits = collect_keyword_hits(
+                                let hits = collect_keyword_hits_with_provenance(
                                     &existing.snapshot,
                                     &pane.content,
                                     &registration.keywords,
+                                    KeywordMatchProvenance {
+                                        pane_id: pane.pane_id.clone(),
+                                        pane_name: pane.pane_name.clone(),
+                                        cursor: None,
+                                        source: KeywordMatchSource::FreshOutput,
+                                    },
                                 );
                                 existing.pane_name = pane.pane_name;
-                                existing.snapshot = pane.content.clone();
+                                existing.snapshot = pane.content;
                                 existing.content_hash = hash;
                                 existing.last_change = now;
                                 existing.last_stale_notification = None;
-                                update_pi_state_on_pane_change(
-                                    pi_state_store,
-                                    registration,
-                                    session_name,
-                                    &pane.content,
-                                )
-                                .await;
-                                maybe_emit_pi_pr_created(
-                                    tx,
-                                    &mut state.pi_projection,
-                                    registration,
-                                    session_name,
-                                    &pane.content,
-                                )
-                                .await?;
-                                maybe_emit_pi_retry_needed(
-                                    tx,
-                                    &mut state.pi_projection,
-                                    registration,
-                                    session_name,
-                                    &pane.content,
-                                )
-                                .await?;
-                                clear_pi_blocked_projection(
-                                    &mut state.pi_projection,
-                                    registration,
-                                    session_name,
-                                );
                                 Some(hits)
                             } else {
-                                update_pi_state_without_pane_change(
-                                    pi_state_store,
-                                    registration,
-                                    session_name,
-                                    now,
-                                    should_emit_stale(existing, now, registration.stale_minutes),
-                                )
-                                .await;
-                                maybe_emit_pi_blocked(
-                                    tx,
-                                    pi_state_store,
-                                    &mut state.pi_projection,
-                                    registration,
-                                    session_name,
-                                )
-                                .await?;
                                 if should_emit_stale(existing, now, registration.stale_minutes) {
+                                    telemetry::emit(source_record(
+                                        telemetry::event_name::SOURCE_INVENTORY,
+                                        "stale_emitted",
+                                        Some(session_name),
+                                        None,
+                                    ));
                                     tx.emit(tmux_stale_event(
                                         registration,
                                         existing.session.clone(),
@@ -519,10 +461,18 @@ async fn poll_tmux(
                     }
                 }
             }
-            Err(error) => eprintln!(
-                "clawhip source tmux snapshot failed for {}: {error}",
-                session_name
-            ),
+            Err(error) => {
+                telemetry::emit(source_record(
+                    telemetry::event_name::SOURCE_DEGRADED,
+                    "source_snapshot_failed",
+                    Some(session_name),
+                    Some(error.to_string()),
+                ));
+                eprintln!(
+                    "clawhip source tmux snapshot failed for {}: {error}",
+                    session_name
+                );
+            }
         }
     }
 
@@ -540,6 +490,24 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+fn source_record(
+    event_name: &str,
+    reason_code: &str,
+    session: Option<&str>,
+    error: Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let correlation = format!("source:tmux:{}", session.unwrap_or("inventory"));
+    let mut record = telemetry::record(event_name, reason_code, correlation);
+    record.insert("source".to_string(), serde_json::json!("tmux"));
+    if let Some(session) = session {
+        record.insert("session".to_string(), serde_json::json!(session));
+    }
+    if let Some(error) = error {
+        record.insert("error".to_string(), serde_json::json!(error));
+    }
+    record
 }
 
 async fn sync_active_config_registrations(
@@ -714,12 +682,19 @@ fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> 
 fn tmux_keyword_event(
     registration: &RegisteredTmuxSession,
     session: String,
-    hits: Vec<(String, String)>,
+    hits: Vec<KeywordHit>,
 ) -> IncomingEvent {
     let event = if hits.len() <= 1 {
         match hits.into_iter().next() {
-            Some((keyword, line)) => {
-                IncomingEvent::tmux_keyword(session, keyword, line, registration.channel.clone())
+            Some(hit) => {
+                let mut event = IncomingEvent::tmux_keyword(
+                    session,
+                    hit.keyword,
+                    hit.line,
+                    registration.channel.clone(),
+                );
+                add_keyword_hit_provenance(&mut event.payload, hit.provenance.as_ref());
+                event
             }
             None => IncomingEvent::tmux_keyword(
                 session,
@@ -728,14 +703,90 @@ fn tmux_keyword_event(
                 registration.channel.clone(),
             ),
         }
+    } else if hits.iter().all(|hit| hit.provenance.is_none()) {
+        IncomingEvent::tmux_keywords(
+            session,
+            hits.into_iter()
+                .map(|hit| (hit.keyword, hit.line))
+                .collect(),
+            registration.channel.clone(),
+        )
     } else {
-        IncomingEvent::tmux_keywords(session, hits, registration.channel.clone())
+        let hit_payloads = hits
+            .into_iter()
+            .map(|hit| {
+                let mut payload = serde_json::json!({
+                    "keyword": hit.keyword,
+                    "line": hit.line,
+                });
+                add_keyword_hit_provenance(&mut payload, hit.provenance.as_ref());
+                payload
+            })
+            .collect::<Vec<_>>();
+        tmux_keyword_event_from_hit_payloads(session, registration.channel.clone(), hit_payloads)
     };
 
     event
         .with_routing_metadata(&registration.routing)
         .with_mention(registration.mention.clone())
         .with_format(registration.format.clone())
+}
+
+fn tmux_keyword_event_from_hit_payloads(
+    session: String,
+    channel: Option<String>,
+    hit_payloads: Vec<serde_json::Value>,
+) -> IncomingEvent {
+    let hit_count = hit_payloads.len();
+    let first_keyword = hit_payloads
+        .first()
+        .and_then(|hit| hit.get("keyword"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let first_line = hit_payloads
+        .first()
+        .and_then(|hit| hit.get("line"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    IncomingEvent {
+        kind: "tmux.keyword".to_string(),
+        channel,
+        mention: None,
+        format: None,
+        template: None,
+        payload: serde_json::json!({
+            "session": session,
+            "keyword": first_keyword,
+            "line": first_line,
+            "hit_count": hit_count,
+            "hits": hit_payloads,
+        }),
+    }
+}
+
+fn add_keyword_hit_provenance(
+    payload: &mut serde_json::Value,
+    provenance: Option<&KeywordMatchProvenance>,
+) {
+    let Some(provenance) = provenance else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    object.insert("pane_id".to_string(), serde_json::json!(provenance.pane_id));
+    object.insert(
+        "pane_name".to_string(),
+        serde_json::json!(provenance.pane_name),
+    );
+    if let Some(cursor) = provenance.cursor {
+        object.insert("cursor".to_string(), serde_json::json!(cursor));
+    }
+    object.insert("source".to_string(), serde_json::json!("fresh-output"));
 }
 
 fn tmux_stale_event(
@@ -754,483 +805,6 @@ fn tmux_stale_event(
     .with_routing_metadata(&registration.routing)
     .with_mention(registration.mention.clone())
     .with_format(registration.format.clone())
-}
-
-async fn ensure_pi_state_exists(
-    store: &SharedPiStateStore,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-) {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return;
-    }
-
-    let mut write = store.write().await;
-    write.entry(session_name.to_string()).or_insert_with(|| {
-        PiSessionState::new(
-            session_name.to_string(),
-            registration
-                .routing
-                .project
-                .clone()
-                .or_else(|| registration.routing.repo_name.clone())
-                .unwrap_or_else(|| session_name.to_string()),
-            registration.routing.repo_path.clone().unwrap_or_default(),
-            registration.session.clone(),
-            registration.routing.branch.clone(),
-        )
-    });
-}
-
-async fn update_pi_state_on_pane_change(
-    store: &SharedPiStateStore,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-    pane_content: &str,
-) {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return;
-    }
-
-    let now = unix_now();
-    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
-        store.write().await;
-    let state = write.entry(session_name.to_string()).or_insert_with(|| {
-        PiSessionState::new(
-            session_name.to_string(),
-            registration
-                .routing
-                .project
-                .clone()
-                .or_else(|| registration.routing.repo_name.clone())
-                .unwrap_or_else(|| session_name.to_string()),
-            registration.routing.repo_path.clone().unwrap_or_default(),
-            registration.session.clone(),
-            registration.routing.branch.clone(),
-        )
-    });
-    let last_line = last_nonempty_line(pane_content);
-    state.mark_running(now);
-    state.mark_pane_change(now, last_line.clone());
-    let tool_hint = infer_pi_tool_hint(&last_line);
-    let tool_error = infer_pi_tool_error(&last_line);
-    if tool_hint.is_some() || tool_error.is_some() {
-        state.set_tool_state(tool_hint.is_some(), tool_hint, tool_error, now);
-    }
-}
-
-async fn update_pi_state_without_pane_change(
-    store: &SharedPiStateStore,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-    last_change: Instant,
-    stale: bool,
-) {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return;
-    }
-
-    let now = unix_now();
-    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
-        store.write().await;
-    let Some(state) = write.get_mut(session_name) else {
-        return;
-    };
-    state.attachable = true;
-    state.sources.tmux_exists = true;
-    state.touch(now);
-    if stale {
-        state.mark_stale(now);
-        state.set_tool_state(false, None, None, now);
-    } else if last_change.elapsed() >= Duration::from_secs(120) {
-        let last_line = state.last_observed_text.clone().unwrap_or_default();
-        if looks_like_pi_blocked_or_waiting(&last_line) {
-            state.mark_blocked_or_waiting(now);
-        } else {
-            state.mark_idle(now);
-        }
-        state.set_tool_state(false, None, None, now);
-    }
-}
-
-async fn update_pi_state_on_disappearance(
-    store: &SharedPiStateStore,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-) {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return;
-    }
-
-    let now = unix_now();
-    let mut write: tokio::sync::RwLockWriteGuard<'_, HashMap<String, PiSessionState>> =
-        store.write().await;
-    let Some(state) = write.get_mut(session_name) else {
-        return;
-    };
-
-    match state.lifecycle {
-        crate::pi_state::PiLifecycle::Finished | crate::pi_state::PiLifecycle::Failed => {
-            state.attachable = false;
-            state.touch(now);
-        }
-        crate::pi_state::PiLifecycle::Aborted => {
-            state.attachable = false;
-            state.touch(now);
-        }
-        crate::pi_state::PiLifecycle::Created
-        | crate::pi_state::PiLifecycle::Running
-        | crate::pi_state::PiLifecycle::Unknown => {
-            state.mark_aborted(now);
-            state.attachable = false;
-            state.confidence.lifecycle = PiConfidence::Low;
-        }
-    }
-}
-
-fn looks_like_pi_blocked_or_waiting(line: &str) -> bool {
-    let normalized = line.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-
-    let strong_markers = [
-        "waiting for input",
-        "need your input",
-        "awaiting your input",
-        "question for user",
-        "press enter to continue",
-        "press any key to continue",
-        "hit enter to continue",
-        "select an option",
-        "choose an option",
-        "waiting for review",
-        "approval required",
-    ];
-    if strong_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-    {
-        return true;
-    }
-
-    let question_markers = [
-        "continue",
-        "approve",
-        "choose",
-        "select",
-        "which",
-        "what should",
-        "would you like",
-        "y/n",
-        "yes/no",
-    ];
-    normalized.contains('?')
-        && question_markers
-            .iter()
-            .any(|marker| normalized.contains(marker))
-}
-
-fn infer_pi_tool_hint(line: &str) -> Option<String> {
-    let normalized = line.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    let tool_markers = [
-        ("cargo ", "cargo"),
-        ("cargo-", "cargo"),
-        ("git ", "git"),
-        ("gh ", "gh"),
-        ("python ", "python"),
-        ("python3 ", "python3"),
-        ("node ", "node"),
-        ("npm ", "npm"),
-        ("pnpm ", "pnpm"),
-        ("yarn ", "yarn"),
-        ("bash ", "bash"),
-        ("sh ", "sh"),
-        ("pytest", "pytest"),
-        ("jest", "jest"),
-        ("vitest", "vitest"),
-        ("go test", "go test"),
-    ];
-    tool_markers
-        .iter()
-        .find_map(|(needle, name)| normalized.contains(needle).then(|| (*name).to_string()))
-}
-
-fn infer_pi_tool_error(line: &str) -> Option<String> {
-    let normalized = line.trim().to_ascii_lowercase();
-    let error_markers = ["error:", "failed", "panic", "exception", "traceback"];
-    error_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-        .then(|| line.trim().to_string())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PiPrCreatedEvidence {
-    key: String,
-    summary: String,
-    pr_url: Option<String>,
-    pr_number: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PiRetryNeededEvidence {
-    key: String,
-    summary: String,
-}
-
-fn infer_pi_pr_created(pane_content: &str) -> Option<PiPrCreatedEvidence> {
-    pane_content.lines().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let lower = trimmed.to_ascii_lowercase();
-        let pr_url = extract_github_pr_url(trimmed);
-        let pr_number = pr_url
-            .as_deref()
-            .and_then(parse_pr_number_from_url)
-            .or_else(|| parse_pr_number_from_text(trimmed));
-        let strong_phrase = lower.contains("pr created")
-            || lower.contains("pull request created")
-            || lower.contains("created pull request");
-
-        if pr_url.is_some() || strong_phrase {
-            Some(PiPrCreatedEvidence {
-                key: pr_url.clone().unwrap_or_else(|| trimmed.to_string()),
-                summary: trimmed.to_string(),
-                pr_url,
-                pr_number,
-            })
-        } else {
-            None
-        }
-    })
-}
-
-fn infer_pi_retry_needed(pane_content: &str) -> Option<PiRetryNeededEvidence> {
-    pane_content.lines().rev().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let lower = trimmed.to_ascii_lowercase();
-        let strong = lower.contains("retry needed")
-            || lower.contains("please retry")
-            || lower.contains("try again")
-            || lower.contains("rerun required")
-            || lower.contains("re-run required")
-            || lower.contains("please rerun")
-            || lower.contains("please re-run");
-
-        strong.then(|| PiRetryNeededEvidence {
-            key: trimmed.to_string(),
-            summary: trimmed.to_string(),
-        })
-    })
-}
-
-fn extract_github_pr_url(line: &str) -> Option<String> {
-    let start = line.find("https://github.com/")?;
-    let tail = &line[start..];
-    let url = tail
-        .split_whitespace()
-        .next()?
-        .trim_end_matches([',', ')', ']', '.']);
-    url.contains("/pull/").then(|| url.to_string())
-}
-
-fn parse_pr_number_from_url(url: &str) -> Option<u64> {
-    let number = url.rsplit('/').next()?;
-    number.parse::<u64>().ok()
-}
-
-fn parse_pr_number_from_text(line: &str) -> Option<u64> {
-    let lower = line.to_ascii_lowercase();
-    let marker = lower.find("pr #")?;
-    let digits = lower[marker + 4..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    (!digits.is_empty())
-        .then(|| digits.parse::<u64>().ok())
-        .flatten()
-}
-
-fn pi_session_event(
-    registration: &RegisteredTmuxSession,
-    kind: &str,
-    session_name: &str,
-    status: &str,
-    summary: String,
-    pr_url: Option<String>,
-    pr_number: Option<u64>,
-) -> IncomingEvent {
-    let mut payload = json!({
-        "tool": "pi",
-        "session_name": session_name,
-        "session_id": session_name,
-        "repo_name": registration.routing.project.clone().or_else(|| registration.routing.repo_name.clone()).unwrap_or_else(|| session_name.to_string()),
-        "repo_path": registration.routing.repo_path.clone().unwrap_or_default(),
-        "status": status,
-        "summary": summary,
-        "contract_event": kind,
-        "mention": registration.mention.clone(),
-    });
-
-    if let Some(branch) = &registration.routing.branch {
-        payload["branch"] = json!(branch);
-    }
-    if let Some(pr_url) = pr_url {
-        payload["pr_url"] = json!(pr_url);
-    }
-    if let Some(pr_number) = pr_number {
-        payload["pr_number"] = json!(pr_number);
-    }
-
-    IncomingEvent {
-        kind: kind.to_string(),
-        channel: registration.channel.clone(),
-        mention: registration.mention.clone(),
-        format: registration.format.clone(),
-        template: None,
-        payload,
-    }
-}
-
-fn clear_pi_blocked_projection(
-    projection: &mut HashMap<String, PiProjectionMemo>,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-) {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return;
-    }
-    projection
-        .entry(session_name.to_string())
-        .or_default()
-        .blocked_active = false;
-}
-
-async fn maybe_emit_pi_blocked<E: EventEmitter>(
-    emitter: &E,
-    store: &SharedPiStateStore,
-    projection: &mut HashMap<String, PiProjectionMemo>,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-) -> Result<()> {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return Ok(());
-    }
-
-    let Some((activity, summary)) = current_pi_activity(store, session_name).await else {
-        return Ok(());
-    };
-    let memo = projection.entry(session_name.to_string()).or_default();
-
-    if activity == PiActivity::BlockedOrWaiting {
-        if !memo.blocked_active {
-            memo.blocked_active = true;
-            emitter
-                .emit(pi_session_event(
-                    registration,
-                    "session.blocked",
-                    session_name,
-                    "blocked",
-                    summary.unwrap_or_else(|| {
-                        "Pi appears to be waiting for operator input".to_string()
-                    }),
-                    None,
-                    None,
-                ))
-                .await?;
-        }
-    } else {
-        memo.blocked_active = false;
-    }
-
-    Ok(())
-}
-
-async fn maybe_emit_pi_pr_created<E: EventEmitter>(
-    emitter: &E,
-    projection: &mut HashMap<String, PiProjectionMemo>,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-    pane_content: &str,
-) -> Result<()> {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return Ok(());
-    }
-
-    let Some(evidence) = infer_pi_pr_created(pane_content) else {
-        return Ok(());
-    };
-    let memo = projection.entry(session_name.to_string()).or_default();
-    if memo.last_pr_created_key.as_deref() == Some(evidence.key.as_str()) {
-        return Ok(());
-    }
-
-    memo.last_pr_created_key = Some(evidence.key.clone());
-    emitter
-        .emit(pi_session_event(
-            registration,
-            "session.pr-created",
-            session_name,
-            "pr-created",
-            evidence.summary,
-            evidence.pr_url,
-            evidence.pr_number,
-        ))
-        .await
-}
-
-async fn maybe_emit_pi_retry_needed<E: EventEmitter>(
-    emitter: &E,
-    projection: &mut HashMap<String, PiProjectionMemo>,
-    registration: &RegisteredTmuxSession,
-    session_name: &str,
-    pane_content: &str,
-) -> Result<()> {
-    if registration.routing.tool.as_deref() != Some("pi") {
-        return Ok(());
-    }
-
-    let Some(evidence) = infer_pi_retry_needed(pane_content) else {
-        return Ok(());
-    };
-    let memo = projection.entry(session_name.to_string()).or_default();
-    if memo.last_retry_needed_key.as_deref() == Some(evidence.key.as_str()) {
-        return Ok(());
-    }
-
-    memo.last_retry_needed_key = Some(evidence.key.clone());
-    emitter
-        .emit(pi_session_event(
-            registration,
-            "session.retry-needed",
-            session_name,
-            "retry-needed",
-            evidence.summary,
-            None,
-            None,
-        ))
-        .await
-}
-
-async fn current_pi_activity(
-    store: &SharedPiStateStore,
-    session_name: &str,
-) -> Option<(PiActivity, Option<String>)> {
-    let read = store.read().await;
-    let state = read.get(session_name)?;
-    Some((state.activity, state.last_observed_text.clone()))
 }
 
 async fn flush_pending_keyword_hits<E: EventEmitter>(
@@ -1253,11 +827,7 @@ async fn flush_pending_keyword_hits<E: EventEmitter>(
     let Some(pending) = pending_keyword_hits.take() else {
         return Ok(());
     };
-    let hits = pending
-        .into_hits()
-        .into_iter()
-        .map(|hit| (hit.keyword, hit.line))
-        .collect::<Vec<_>>();
+    let hits = pending.into_hits();
     if hits.is_empty() {
         return Ok(());
     }
@@ -1435,7 +1005,7 @@ pub fn current_timestamp_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::event::{EventBody, compat::from_incoming_event};
-    use crate::keyword_window::KeywordHit;
+    use crate::keyword_window::{KeywordHit, collect_keyword_hits};
 
     fn registration(keywords: Vec<&str>) -> RegisteredTmuxSession {
         RegisteredTmuxSession {
@@ -1451,6 +1021,14 @@ mod tests {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+        }
+    }
+
+    fn keyword_hit(keyword: &str, line: &str) -> KeywordHit {
+        KeywordHit {
+            keyword: keyword.into(),
+            line: line.into(),
+            provenance: None,
         }
     }
 
@@ -1478,7 +1056,7 @@ PR created #7",
         let event = tmux_keyword_event(
             &registration,
             "issue-24".into(),
-            vec![("error".into(), "boom".into())],
+            vec![keyword_hit("error", "boom")],
         );
 
         assert_eq!(event.channel.as_deref(), Some("alerts"));
@@ -1488,6 +1066,30 @@ PR created #7",
         assert_eq!(event.payload["keyword"], "error");
         assert_eq!(event.payload["line"], "boom");
         assert_eq!(event.payload["hit_count"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn tmux_keyword_event_includes_match_provenance() {
+        let registration = registration(vec!["error"]);
+        let event = tmux_keyword_event(
+            &registration,
+            "issue-24".into(),
+            vec![KeywordHit {
+                keyword: "error".into(),
+                line: "error: failed".into(),
+                provenance: Some(KeywordMatchProvenance {
+                    pane_id: "%3".into(),
+                    pane_name: "0.1".into(),
+                    cursor: Some(42),
+                    source: KeywordMatchSource::FreshOutput,
+                }),
+            }],
+        );
+
+        assert_eq!(event.payload["pane_id"], "%3");
+        assert_eq!(event.payload["pane_name"], "0.1");
+        assert_eq!(event.payload["cursor"], 42);
+        assert_eq!(event.payload["source"], "fresh-output");
     }
 
     #[test]
@@ -1503,7 +1105,7 @@ PR created #7",
         let event = tmux_keyword_event(
             &registration,
             "clawhip-issue-152".into(),
-            vec![("error".into(), "boom".into())],
+            vec![keyword_hit("error", "boom")],
         );
 
         assert_eq!(event.payload["project"], "clawhip");
@@ -1523,8 +1125,8 @@ PR created #7",
             &registration,
             "issue-24".into(),
             vec![
-                ("error".into(), "boom".into()),
-                ("complete".into(), "done".into()),
+                keyword_hit("error", "boom"),
+                keyword_hit("complete", "done"),
             ],
         );
 
@@ -1707,14 +1309,17 @@ PR created #7",
                 KeywordHit {
                     keyword: "error".into(),
                     line: "error: failed".into(),
+                    provenance: None,
                 },
                 KeywordHit {
                     keyword: "error".into(),
                     line: "error: failed".into(),
+                    provenance: None,
                 },
                 KeywordHit {
                     keyword: "complete".into(),
                     line: "complete".into(),
+                    provenance: None,
                 },
             ]);
             pending
@@ -1754,6 +1359,7 @@ PR created #7",
             pending.push(vec![KeywordHit {
                 keyword: "error".into(),
                 line: "boom".into(),
+                provenance: None,
             }]);
             pending
         });
@@ -1856,6 +1462,7 @@ error: failed";
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: failed".into(),
+                provenance: None,
             }],
         );
         push_session_pending_keyword_hits(
@@ -1866,10 +1473,12 @@ error: failed";
                 KeywordHit {
                     keyword: "error".into(),
                     line: "error: failed".into(),
+                    provenance: None,
                 },
                 KeywordHit {
                     keyword: "complete".into(),
                     line: "build complete".into(),
+                    provenance: None,
                 },
             ],
         );
@@ -1914,6 +1523,7 @@ error: failed";
             vec![KeywordHit {
                 keyword: "error".into(),
                 line: "error: failed".into(),
+                provenance: None,
             }],
         );
 
