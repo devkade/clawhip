@@ -55,19 +55,40 @@ Operational flow:
 6. Confirm the merged status message arrives.
 7. Delete temporary branches if desired.
 
-### Native OMC / OMX contract
+### Provider-native Codex + Claude contract
 
-- legacy wrapper `agent.*` emits
-- normalized `session.*` contract from OMC/OMX payloads
+- shared event set: `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`
+- generic ingestion via `clawhip native hook --provider <codex|claude>`
 
 Operational flow:
 
-1. Emit a legacy compatibility event such as `clawhip emit agent.finished --agent omx --session issue-65 --project clawhip --elapsed 42`.
-2. Confirm clawhip accepts it and renders a stable lifecycle message.
-3. Post one representative OMC payload carrying `signal.routeKey` to `/event`.
-4. Confirm clawhip normalizes it into the expected `session.*` route family.
-5. Post one representative OMX payload carrying `context.normalized_event` to `/event`.
-6. Confirm the rendered message stays low-noise and includes normalized metadata like repo/session/issue/PR when present.
+1. Enable provider-native hooks in a real Codex or Claude Code workspace:
+   - Codex: `clawhip hooks install --provider codex --scope global` or `--scope project` (matching the official Codex `hooks.json` search locations)
+   - Claude Code: `clawhip hooks install --provider claude-code --scope global`
+2. Pipe one representative Codex payload through the generic native ingress:
+
+```bash
+printf '%s\n' '{
+  "session_id": "sess-65",
+  "cwd": "/repo/clawhip",
+  "event": "SessionStart"
+}' | clawhip native hook --provider codex
+```
+
+3. Confirm clawhip accepts it and renders a stable lifecycle message with project/repo context.
+4. Repeat with a representative Claude payload:
+
+```bash
+printf '%s\n' '{
+  "session_id": "sess-65",
+  "cwd": "/repo/clawhip",
+  "event": "SessionStart"
+}' | clawhip native hook --provider claude
+```
+
+5. Confirm both providers normalize into the same shared route family.
+6. Send representative payloads for `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`.
+7. Confirm additive augmentation still preserves the base routing keys when `.clawhip/hooks/` is enabled.
 
 ### tmux presets
 
@@ -77,13 +98,13 @@ Operational flow:
 
 Operational flow:
 
-1. Use a monitored tmux session name that matches the route filter.
-2. Print a configured keyword (`error`, `FAILED`, `PR created`, etc).
-3. Confirm the keyword notification in Discord.
-4. Leave the session idle beyond the stale threshold.
-5. Confirm the stale notification in Discord.
-6. Launch a session via `clawhip tmux new ...`.
-7. Confirm wrapper registration + keyword/stale delivery.
+1. Launch a real Codex or Claude session with provider-native hooks enabled.
+2. Verify the pane is actually alive before trusting any `agent.started` message.
+3. Confirm routed delivery in Discord.
+4. Print a configured keyword (`error`, `FAILED`, `PR created`, etc) only when intentionally testing keyword behavior.
+5. Leave the session idle beyond the stale threshold only when intentionally testing stale behavior.
+6. Inspect `clawhip tmux list` to confirm exactly which watch registrations exist.
+7. If alert text disagrees with pane reality, treat it as monitor noise and debug registration overlap / stale math before assuming session failure.
 
 ### Pi Layer A presets
 

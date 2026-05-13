@@ -64,6 +64,17 @@ pub struct GitHubCIEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubReleaseEvent {
+    pub repo: String,
+    pub tag: String,
+    pub name: String,
+    pub action: String,
+    pub is_prerelease: bool,
+    pub url: String,
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxKeywordEvent {
     pub session: String,
     pub keyword: String,
@@ -88,13 +99,39 @@ pub struct TmuxStaleEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEvent {
     pub agent_name: String,
+    pub session_name: Option<String>,
     pub status: String,
+    pub normalized_event: Option<String>,
     pub session_id: Option<String>,
     pub project: Option<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub issue_number: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub command: Option<String>,
+    pub tool_name: Option<String>,
+    pub tmux_session: Option<String>,
+    pub tmux_window: Option<String>,
+    pub tmux_pane: Option<String>,
+    pub tmux_pane_tty: Option<String>,
+    pub tmux_attached: Option<bool>,
+    pub tmux_client_count: Option<u64>,
     pub elapsed_secs: Option<u64>,
     pub summary: Option<String>,
+    pub error_summary: Option<String>,
     pub error_message: Option<String>,
     pub mention: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvent {
+    pub source_tool: String,
+    pub workspace_path: String,
+    pub state_file: String,
+    pub session_name: Option<String>,
+    pub diff_fields: Vec<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

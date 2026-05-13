@@ -4,6 +4,8 @@ use std::path::Path;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 use crate::Result;
 use crate::render::{DefaultRenderer, Renderer};
@@ -55,6 +57,24 @@ pub struct IncomingEvent {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingMetadata {
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo_name: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct IncomingEventWire {
     #[serde(rename = "type", alias = "kind", alias = "event")]
@@ -95,6 +115,17 @@ impl<'de> Deserialize<'de> for IncomingEvent {
 }
 
 impl IncomingEvent {
+    pub fn workspace(kind: String, payload: Value, channel: Option<String>) -> Self {
+        Self {
+            kind,
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload,
+        }
+    }
+
     pub fn custom(channel: Option<String>, message: String) -> Self {
         Self {
             kind: "custom".to_string(),
@@ -451,6 +482,43 @@ impl IncomingEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn github_release(
+        action: &str,
+        repo: String,
+        tag: String,
+        name: String,
+        is_prerelease: bool,
+        url: String,
+        actor: Option<String>,
+        channel: Option<String>,
+    ) -> Self {
+        let kind = match action {
+            "prereleased" => "github.release-prereleased",
+            "edited" => "github.release-edited",
+            _ => "github.release-published",
+        };
+        let mut payload = Map::new();
+        payload.insert("repo".to_string(), json!(repo));
+        payload.insert("tag".to_string(), json!(tag));
+        payload.insert("name".to_string(), json!(name));
+        payload.insert("action".to_string(), json!(action));
+        payload.insert("is_prerelease".to_string(), json!(is_prerelease));
+        payload.insert("url".to_string(), json!(url));
+        if let Some(actor) = actor {
+            payload.insert("actor".to_string(), json!(actor));
+        }
+
+        Self {
+            kind: kind.to_string(),
+            channel,
+            mention: None,
+            format: None,
+            template: None,
+            payload: Value::Object(payload),
+        }
+    }
+
     pub fn tmux_keyword(
         session: String,
         keyword: String,
@@ -547,6 +615,44 @@ impl IncomingEvent {
         self
     }
 
+    pub fn with_repo_context(
+        mut self,
+        repo_path: Option<String>,
+        worktree_path: Option<String>,
+    ) -> Self {
+        if let Some(payload) = self.payload.as_object_mut() {
+            if let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) {
+                payload.insert("repo_path".to_string(), json!(repo_path));
+            }
+            if let Some(worktree_path) = worktree_path.filter(|value| !value.trim().is_empty()) {
+                payload.insert("worktree_path".to_string(), json!(worktree_path));
+            }
+        }
+        self
+    }
+
+    pub fn with_routing_metadata(mut self, routing: &RoutingMetadata) -> Self {
+        let Some(payload) = self.payload.as_object_mut() else {
+            return self;
+        };
+
+        for (key, value) in [
+            ("tool", routing.tool.as_deref()),
+            ("project", routing.project.as_deref()),
+            ("repo_name", routing.repo_name.as_deref()),
+            ("repo_path", routing.repo_path.as_deref()),
+            ("worktree_path", routing.worktree_path.as_deref()),
+            ("session_id", routing.session_id.as_deref()),
+            ("branch", routing.branch.as_deref()),
+        ] {
+            if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+                payload.insert(key.to_string(), json!(value));
+            }
+        }
+
+        self
+    }
+
     pub fn canonical_kind(&self) -> &str {
         match self.kind.as_str() {
             "issue-opened" => "github.issue-opened",
@@ -561,6 +667,10 @@ impl IncomingEvent {
             "test-finished" => "session.test-finished",
             "test-failed" => "session.test-failed",
             "handoff-needed" => "session.handoff-needed",
+            "prompt-submitted" => "session.prompt-submitted",
+            "prompt-delivered" => "session.prompt-delivered",
+            "prompt-delivery-failed" => "session.prompt-delivery-failed",
+            "stopped" => "session.stopped",
             other => other,
         }
     }
@@ -572,9 +682,77 @@ impl IncomingEvent {
 
     pub fn template_context(&self) -> BTreeMap<String, String> {
         let mut context = BTreeMap::new();
-        context.insert("kind".to_string(), self.canonical_kind().to_string());
+        let canonical_kind = self.canonical_kind().to_string();
+        if let Some(channel) = self
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("channel".to_string(), channel.to_string());
+            context.insert("channel_hint".to_string(), channel.to_string());
+        }
+        if let Some(mention) = self
+            .mention
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("mention".to_string(), mention.to_string());
+        }
+        if let Some(format) = self.format.as_ref() {
+            context.insert("format".to_string(), format.as_str().to_string());
+        }
+        if let Some(template) = self
+            .template
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("template".to_string(), template.to_string());
+        }
         flatten_json("", &self.payload, &mut context);
+        insert_context_aliases(&mut context, &canonical_kind);
         context
+    }
+}
+
+fn insert_context_aliases(context: &mut BTreeMap<String, String>, canonical_kind: &str) {
+    if let Some(payload_event) = context.insert("event".to_string(), canonical_kind.to_string()) {
+        context
+            .entry("payload_event".to_string())
+            .or_insert(payload_event);
+    }
+    if let Some(payload_contract_event) =
+        context.insert("contract_event".to_string(), canonical_kind.to_string())
+    {
+        context
+            .entry("payload_contract_event".to_string())
+            .or_insert(payload_contract_event);
+    }
+    context.insert("kind".to_string(), canonical_kind.to_string());
+
+    insert_context_alias_pair(context, "repo", "repo_name");
+    insert_context_alias_pair(context, "session", "session_name");
+    insert_context_alias_pair(context, "channel", "channel_hint");
+
+    context
+        .entry("route_key".to_string())
+        .or_insert_with(|| canonical_kind.to_string());
+}
+
+fn insert_context_alias_pair(context: &mut BTreeMap<String, String>, primary: &str, alias: &str) {
+    let primary_value = context.get(primary).cloned();
+    let alias_value = context.get(alias).cloned();
+
+    match (primary_value, alias_value) {
+        (Some(primary_value), None) => {
+            context.insert(alias.to_string(), primary_value);
+        }
+        (None, Some(alias_value)) => {
+            context.insert(primary.to_string(), alias_value);
+        }
+        _ => {}
     }
 }
 
@@ -645,11 +823,25 @@ fn map_native_signal(raw: &str) -> Option<&'static str> {
         }
         "test-failed" | "session.test-failed" | "test.failed" => Some("session.test-failed"),
         "handoff-needed" | "session.handoff-needed" => Some("session.handoff-needed"),
+        "stop" | "stopped" | "session.stopped" => Some("session.stopped"),
+        "userpromptsubmit"
+        | "user-prompt-submit"
+        | "user-prompt-submitted"
+        | "prompt-submitted"
+        | "prompt.submitted"
+        | "session.prompt-submitted" => Some("session.prompt-submitted"),
+        "prompt-delivered" | "session.prompt-delivered" | "first-prompt-delivered" => {
+            Some("session.prompt-delivered")
+        }
+        "prompt-delivery-failed"
+        | "session.prompt-delivery-failed"
+        | "first-prompt-delivery-failed" => Some("session.prompt-delivery-failed"),
         _ => None,
     }
 }
 
 fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind: &str) {
+    let first_seen_at = now_rfc3339();
     let tool = infer_tool(payload);
     let session_name = first_string(
         payload,
@@ -679,10 +871,25 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             "/context/session_name",
         ],
     );
-    let project = first_string(payload, &["/project", "/projectName", "/project_name"]);
+    let project = first_string(
+        payload,
+        &[
+            "/project",
+            "/projectName",
+            "/project_name",
+            "/context/project",
+            "/context/projectName",
+            "/context/project_name",
+        ],
+    );
     let repo_name = first_string(
         payload,
-        &["/repo_name", "/context/repo_name", "/projectName"],
+        &[
+            "/repo_name",
+            "/context/repo_name",
+            "/projectName",
+            "/context/projectName",
+        ],
     )
     .or_else(|| {
         first_string(payload, &["/repo_path", "/context/repo_path"]).and_then(|path| {
@@ -694,11 +901,21 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     });
     let repo_path = first_string(
         payload,
-        &["/repo_path", "/context/repo_path", "/projectPath"],
+        &[
+            "/repo_path",
+            "/context/repo_path",
+            "/projectPath",
+            "/context/projectPath",
+        ],
     );
     let worktree_path = first_string(
         payload,
-        &["/worktree_path", "/context/worktree_path", "/projectPath"],
+        &[
+            "/worktree_path",
+            "/context/worktree_path",
+            "/projectPath",
+            "/context/projectPath",
+        ],
     );
     let branch = first_string(payload, &["/branch", "/context/branch"]);
     let command = first_string(
@@ -716,6 +933,7 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
                 .and_then(infer_test_runner)
                 .map(ToString::to_string)
         });
+    let elapsed_secs = first_u64(payload, &["/elapsed_secs", "/context/elapsed_secs"]);
     let status = first_string(payload, &["/status", "/context/status", "/signal/phase"])
         .or_else(|| event_status_from_kind(canonical_kind).map(ToString::to_string));
     let summary = first_string(
@@ -724,6 +942,7 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             "/summary",
             "/signal/summary",
             "/reason",
+            "/context/summary",
             "/context/contextSummary",
             "/context/reason",
             "/context/question",
@@ -745,11 +964,117 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             .flatten()
     });
     let event_timestamp = first_string(payload, &["/event_timestamp", "/timestamp"]);
+    let event_id =
+        first_string(payload, &["/event_id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let correlation_id = first_string(payload, &["/correlation_id"])
+        .or_else(|| {
+            [
+                session_id.as_deref(),
+                session_name.as_deref(),
+                project.as_deref(),
+                repo_name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| event_id.clone());
     let route_key = first_string(
         payload,
         &["/route_key", "/signal/routeKey", "/context/route_key"],
     );
     let source = first_string(payload, &["/source"]);
+    let tmux_session = first_string(
+        payload,
+        &[
+            "/tmux_session",
+            "/tmuxSession",
+            "/context/tmux_session",
+            "/context/tmuxSession",
+            "/tmux/session",
+            "/context/tmux/session",
+            "/payload/tmux_session",
+            "/payload/tmuxSession",
+            "/payload/tmux/session",
+        ],
+    );
+    let tmux_window = first_string(
+        payload,
+        &[
+            "/tmux_window",
+            "/tmuxWindow",
+            "/context/tmux_window",
+            "/context/tmuxWindow",
+            "/tmux/window",
+            "/context/tmux/window",
+            "/payload/tmux_window",
+            "/payload/tmuxWindow",
+            "/payload/tmux/window",
+        ],
+    );
+    let tmux_pane = first_string(
+        payload,
+        &[
+            "/tmux_pane",
+            "/tmuxPane",
+            "/context/tmux_pane",
+            "/context/tmuxPane",
+            "/tmux/pane",
+            "/context/tmux/pane",
+            "/payload/tmux_pane",
+            "/payload/tmuxPane",
+            "/payload/tmux/pane",
+        ],
+    );
+    let tmux_pane_tty = first_string(
+        payload,
+        &[
+            "/tmux_pane_tty",
+            "/tmuxPaneTty",
+            "/context/tmux_pane_tty",
+            "/context/tmuxPaneTty",
+            "/tmux/pane_tty",
+            "/tmux/paneTty",
+            "/context/tmux/pane_tty",
+            "/context/tmux/paneTty",
+            "/payload/tmux_pane_tty",
+            "/payload/tmuxPaneTty",
+            "/payload/tmux/pane_tty",
+            "/payload/tmux/paneTty",
+        ],
+    );
+    let tmux_attached = first_boolish(
+        payload,
+        &[
+            "/tmux_attached",
+            "/tmuxAttached",
+            "/context/tmux_attached",
+            "/context/tmuxAttached",
+            "/tmux/attached",
+            "/context/tmux/attached",
+            "/payload/tmux_attached",
+            "/payload/tmuxAttached",
+            "/payload/tmux/attached",
+        ],
+    );
+    let tmux_client_count = first_u64ish(
+        payload,
+        &[
+            "/tmux_client_count",
+            "/tmuxClientCount",
+            "/context/tmux_client_count",
+            "/context/tmuxClientCount",
+            "/tmux/client_count",
+            "/tmux/clientCount",
+            "/context/tmux/client_count",
+            "/context/tmux/clientCount",
+            "/payload/tmux_client_count",
+            "/payload/tmuxClientCount",
+            "/payload/tmux/client_count",
+            "/payload/tmux/clientCount",
+        ],
+    );
     let mut issue_number =
         first_u64(payload, &["/issue_number", "/context/issue_number"]).or_else(|| {
             [
@@ -763,7 +1088,13 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
             .find_map(extract_issue_number)
         });
     let mut pr_number = first_u64(payload, &["/pr_number", "/context/pr_number"]);
-    let pr_url = first_string(payload, &["/pr_url", "/context/pr_url", "/signal/prUrl"]);
+    let pr_url =
+        first_string(payload, &["/pr_url", "/context/pr_url", "/signal/prUrl"]).or_else(|| {
+            summary
+                .as_ref()
+                .filter(|value| extract_pr_number_from_url(value).is_some())
+                .cloned()
+        });
     if pr_number.is_none() {
         pr_number = pr_url.as_deref().and_then(extract_pr_number_from_url);
     }
@@ -785,6 +1116,9 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
         .or_insert_with(|| json!(canonical_kind));
 
     insert_string_if_missing(object, "tool", tool);
+    insert_string_if_missing(object, "event_id", Some(event_id));
+    insert_string_if_missing(object, "correlation_id", Some(correlation_id));
+    insert_string_if_missing(object, "first_seen_at", Some(first_seen_at));
     if (canonical_kind.starts_with("agent.") || canonical_kind.starts_with("session."))
         && object.get("agent_name").is_none()
         && let Some(tool) = object
@@ -808,12 +1142,26 @@ fn normalize_native_metadata(payload: &mut Value, raw_kind: &str, canonical_kind
     insert_string_if_missing(object, "command", command);
     insert_string_if_missing(object, "tool_name", tool_name);
     insert_string_if_missing(object, "test_runner", test_runner);
-    insert_string_if_missing(object, "status", status);
+    insert_u64_if_missing(object, "elapsed_secs", elapsed_secs);
+    insert_string_if_missing(object, "status", status.clone());
+    insert_string_if_missing(object, "normalized_event", status);
     insert_string_if_missing(object, "summary", summary);
     insert_string_if_missing(object, "error_message", error_message);
     insert_string_if_missing(object, "event_timestamp", event_timestamp);
     insert_string_if_missing(object, "route_key", route_key);
     insert_string_if_missing(object, "source", source);
+    insert_string_if_missing(object, "tmux_session", tmux_session);
+    insert_string_if_missing(object, "tmux_window", tmux_window);
+    insert_string_if_missing(object, "tmux_pane", tmux_pane);
+    insert_string_if_missing(object, "tmux_pane_tty", tmux_pane_tty);
+    insert_bool_if_missing(object, "tmux_attached", tmux_attached);
+    insert_u64_if_missing(object, "tmux_client_count", tmux_client_count);
+}
+
+fn now_rfc3339() -> String {
+    let now = OffsetDateTime::now_utc();
+    now.format(&Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
 }
 
 fn infer_tool(payload: &Value) -> Option<String> {
@@ -877,6 +1225,10 @@ fn event_status_from_kind(kind: &str) -> Option<&'static str> {
         "session.test-finished" => Some("test-finished"),
         "session.test-failed" => Some("test-failed"),
         "session.handoff-needed" => Some("handoff-needed"),
+        "session.prompt-submitted" => Some("prompt-submitted"),
+        "session.prompt-delivered" => Some("prompt-delivered"),
+        "session.prompt-delivery-failed" => Some("prompt-delivery-failed"),
+        "session.stopped" => Some("stopped"),
         _ => None,
     }
 }
@@ -898,6 +1250,33 @@ fn first_u64(payload: &Value, pointers: &[&str]) -> Option<u64> {
         .find_map(|pointer| payload.pointer(pointer).and_then(Value::as_u64))
 }
 
+fn first_boolish(payload: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers.iter().find_map(|pointer| {
+        let value = payload.pointer(pointer)?;
+        match value {
+            Value::Bool(value) => Some(*value),
+            Value::Number(value) => value.as_u64().map(|number| number != 0),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "attached" => Some(true),
+                "0" | "false" | "no" | "detached" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+fn first_u64ish(payload: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        let value = payload.pointer(pointer)?;
+        match value {
+            Value::Number(value) => value.as_u64(),
+            Value::String(value) => value.trim().parse::<u64>().ok(),
+            _ => None,
+        }
+    })
+}
+
 fn insert_string_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if object.get(key).is_none()
         && let Some(value) = value
@@ -907,6 +1286,14 @@ fn insert_string_if_missing(object: &mut Map<String, Value>, key: &str, value: O
 }
 
 fn insert_u64_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<u64>) {
+    if object.get(key).is_none()
+        && let Some(value) = value
+    {
+        object.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_bool_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<bool>) {
     if object.get(key).is_none()
         && let Some(value) = value
     {
@@ -986,6 +1373,100 @@ mod tests {
     }
 
     #[test]
+    fn template_context_backfills_repo_and_session_aliases() {
+        let git_event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        );
+        let git_context = git_event.template_context();
+        assert_eq!(git_context.get("repo").map(String::as_str), Some("clawhip"));
+        assert_eq!(
+            git_context.get("repo_name").map(String::as_str),
+            Some("clawhip")
+        );
+        assert_eq!(
+            git_context.get("event").map(String::as_str),
+            Some("git.commit")
+        );
+        assert_eq!(
+            git_context.get("contract_event").map(String::as_str),
+            Some("git.commit")
+        );
+        assert_eq!(
+            git_context.get("route_key").map(String::as_str),
+            Some("git.commit")
+        );
+
+        let tmux_event = IncomingEvent::tmux_keyword(
+            "issue-132".into(),
+            "error".into(),
+            "boom".into(),
+            Some("alerts".into()),
+        );
+        let tmux_context = tmux_event.template_context();
+        assert_eq!(
+            tmux_context.get("session").map(String::as_str),
+            Some("issue-132")
+        );
+        assert_eq!(
+            tmux_context.get("session_name").map(String::as_str),
+            Some("issue-132")
+        );
+        assert_eq!(
+            tmux_context.get("channel").map(String::as_str),
+            Some("alerts")
+        );
+        assert_eq!(
+            tmux_context.get("channel_hint").map(String::as_str),
+            Some("alerts")
+        );
+    }
+
+    #[test]
+    fn template_context_preserves_payload_event_without_overwriting_canonical_aliases() {
+        let event = normalize_event(IncomingEvent {
+            kind: "notify".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "event": "test-failed",
+                "contract_event": "legacy.test-failed",
+                "context": {
+                    "normalized_event": "test-failed"
+                }
+            }),
+        });
+
+        let context = event.template_context();
+        assert_eq!(event.kind, "session.test-failed");
+        assert_eq!(
+            context.get("kind").map(String::as_str),
+            Some("session.test-failed")
+        );
+        assert_eq!(
+            context.get("event").map(String::as_str),
+            Some("session.test-failed")
+        );
+        assert_eq!(
+            context.get("contract_event").map(String::as_str),
+            Some("session.test-failed")
+        );
+        assert_eq!(
+            context.get("payload_event").map(String::as_str),
+            Some("test-failed")
+        );
+        assert_eq!(
+            context.get("payload_contract_event").map(String::as_str),
+            Some("legacy.test-failed")
+        );
+    }
+
+    #[test]
     fn constructors_default_top_level_mention_to_none() {
         let custom = IncomingEvent::custom(None, "wake up".into());
         assert_eq!(custom.mention, None);
@@ -1010,6 +1491,27 @@ mod tests {
         .with_mention(Some("<@123>".into()));
 
         assert_eq!(event.mention.as_deref(), Some("<@123>"));
+    }
+
+    #[test]
+    fn with_repo_context_sets_repo_and_worktree_paths() {
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(
+            Some("/repo/root".into()),
+            Some("/repo/root/.worktrees/issue-115".into()),
+        );
+
+        assert_eq!(event.payload["repo_path"], json!("/repo/root"));
+        assert_eq!(
+            event.payload["worktree_path"],
+            json!("/repo/root/.worktrees/issue-115")
+        );
     }
 
     #[test]
@@ -1296,6 +1798,37 @@ mod tests {
     }
 
     #[test]
+    fn normalize_event_adds_ingress_metadata_and_exposes_it_in_template_context() {
+        let event = normalize_event(IncomingEvent::agent_started(
+            "worker-1".into(),
+            Some("sess-123".into()),
+            Some("my-repo".into()),
+            None,
+            Some("booted".into()),
+            None,
+            None,
+        ));
+        let context = event.template_context();
+
+        let event_id = event.payload["event_id"].as_str().unwrap();
+        assert!(!event_id.is_empty());
+        assert_eq!(event.payload["correlation_id"], json!("sess-123"));
+        assert!(
+            event
+                .payload
+                .get("first_seen_at")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(context.get("event_id").map(String::as_str), Some(event_id));
+        assert_eq!(
+            context.get("correlation_id").map(String::as_str),
+            Some("sess-123")
+        );
+        assert!(context.contains_key("first_seen_at"));
+    }
+
+    #[test]
     fn normalize_event_maps_omx_native_contract_into_session_event() {
         let event = normalize_event(IncomingEvent {
             kind: "notify".into(),
@@ -1314,6 +1847,7 @@ mod tests {
                     "worktree_path": "/repo/clawhip-worktrees/issue-65",
                     "branch": "feat/issue-65-native-event-contract-polish",
                     "issue_number": 65,
+                    "elapsed_secs": 42,
                     "error_summary": "cargo test failed"
                 }
             }),
@@ -1327,10 +1861,170 @@ mod tests {
         );
         assert_eq!(event.payload["repo_name"], json!("clawhip"));
         assert_eq!(event.payload["issue_number"], json!(65));
+        assert_eq!(event.payload["elapsed_secs"], json!(42));
         assert_eq!(event.payload["error_message"], json!("cargo test failed"));
         assert_eq!(
             event.payload["event_timestamp"],
             json!("2026-03-09T18:07:07.000Z")
+        );
+    }
+
+    #[test]
+    fn normalize_event_preserves_tmux_pane_metadata_in_payload_and_template_context() {
+        let event = normalize_event(IncomingEvent {
+            kind: "session-start".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "tool": "codex",
+                "tmux_session": "issue-180",
+                "tmux_window": "2",
+                "tmux_pane": "%11",
+                "tmux_pane_tty": "/dev/pts/42",
+                "tmux_attached": false,
+                "tmux_client_count": 0
+            }),
+        });
+        let context = event.template_context();
+
+        assert_eq!(event.kind, "session.started");
+        assert_eq!(event.payload["session_name"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_session"], json!("issue-180"));
+        assert_eq!(event.payload["tmux_window"], json!("2"));
+        assert_eq!(event.payload["tmux_pane"], json!("%11"));
+        assert_eq!(event.payload["tmux_pane_tty"], json!("/dev/pts/42"));
+        assert_eq!(event.payload["tmux_attached"], json!(false));
+        assert_eq!(event.payload["tmux_client_count"], json!(0));
+        assert_eq!(
+            context.get("session").map(String::as_str),
+            Some("issue-180")
+        );
+        assert_eq!(
+            context.get("tmux_pane_tty").map(String::as_str),
+            Some("/dev/pts/42")
+        );
+        assert_eq!(
+            context.get("tmux_attached").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            context.get("tmux_client_count").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn normalize_event_maps_omc_signal_route_key_into_session_event() {
+        let event = normalize_event(IncomingEvent {
+            kind: "post-tool-use".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "timestamp": "2026-03-09T18:01:58.000Z",
+                "signal": {
+                    "routeKey": "pull-request.created",
+                    "phase": "finished",
+                    "summary": "https://github.com/Yeachan-Heo/clawhip/pull/67"
+                },
+                "context": {
+                    "sessionId": "issue-65",
+                    "projectPath": "/repo/clawhip-worktrees/issue-65",
+                    "projectName": "clawhip"
+                }
+            }),
+        });
+
+        assert_eq!(event.kind, "session.pr-created");
+        assert_eq!(event.payload["tool"], json!("omc"));
+        assert_eq!(event.payload["session_id"], json!("issue-65"));
+        assert_eq!(event.payload["project"], json!("clawhip"));
+        assert_eq!(event.payload["repo_name"], json!("clawhip"));
+        assert_eq!(
+            event.payload["repo_path"],
+            json!("/repo/clawhip-worktrees/issue-65")
+        );
+        assert_eq!(
+            event.payload["worktree_path"],
+            json!("/repo/clawhip-worktrees/issue-65")
+        );
+        assert_eq!(event.payload["pr_number"], json!(67));
+        assert_eq!(
+            event.payload["pr_url"],
+            json!("https://github.com/Yeachan-Heo/clawhip/pull/67")
+        );
+        assert_eq!(event.payload["status"], json!("finished"));
+    }
+
+    #[test]
+    fn normalize_event_maps_omc_native_contract_into_session_event() {
+        let event = normalize_event(IncomingEvent {
+            kind: "post-tool-use".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "timestamp": "2026-03-09T18:01:58.000Z",
+                "signal": {
+                    "routeKey": "pull-request.created",
+                    "toolName": "Bash",
+                    "command": "gh pr create",
+                    "summary": "https://github.com/Yeachan-Heo/clawhip/pull/71"
+                },
+                "context": {
+                    "sessionId": "issue-65",
+                    "projectPath": "/repo/clawhip",
+                    "projectName": "clawhip"
+                }
+            }),
+        });
+
+        assert_eq!(event.kind, "session.pr-created");
+        assert_eq!(event.payload["tool"], json!("omc"));
+        assert_eq!(event.payload["session_id"], json!("issue-65"));
+        assert_eq!(event.payload["project"], json!("clawhip"));
+        assert_eq!(event.payload["repo_name"], json!("clawhip"));
+        assert_eq!(event.payload["repo_path"], json!("/repo/clawhip"));
+        assert_eq!(event.payload["worktree_path"], json!("/repo/clawhip"));
+        assert_eq!(event.payload["tool_name"], json!("Bash"));
+        assert_eq!(event.payload["command"], json!("gh pr create"));
+        assert_eq!(
+            event.payload["summary"],
+            json!("https://github.com/Yeachan-Heo/clawhip/pull/71")
+        );
+        assert_eq!(event.payload["pr_number"], json!(71));
+    }
+
+    #[test]
+    fn renders_omc_pr_created_event_using_contract_label() {
+        let event = normalize_event(IncomingEvent {
+            kind: "post-tool-use".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "timestamp": "2026-03-09T18:01:58.000Z",
+                "signal": {
+                    "routeKey": "pull-request.created",
+                    "phase": "finished",
+                    "summary": "https://github.com/Yeachan-Heo/clawhip/pull/67"
+                },
+                "context": {
+                    "sessionId": "issue-65",
+                    "projectPath": "/repo/clawhip-worktrees/issue-65",
+                    "projectName": "clawhip"
+                }
+            }),
+        });
+
+        assert_eq!(
+            event.render_default(&MessageFormat::Compact).unwrap(),
+            "omc issue-65 pr-created (repo=clawhip, issue=#65, pr=#67, summary=https://github.com/Yeachan-Heo/clawhip/pull/67)"
         );
     }
 
@@ -1472,5 +2166,70 @@ mod tests {
             event.render_default(&MessageFormat::Inline).unwrap(),
             "[tmux:issue-24] 'error': build failed · 'complete': job complete"
         );
+    }
+
+    #[test]
+    fn canonical_kind_maps_prompt_lifecycle_aliases() {
+        let cases = [
+            ("prompt-submitted", "session.prompt-submitted"),
+            ("prompt-delivered", "session.prompt-delivered"),
+            ("prompt-delivery-failed", "session.prompt-delivery-failed"),
+            ("stopped", "session.stopped"),
+        ];
+
+        for (kind, expected) in cases {
+            let event = IncomingEvent {
+                kind: kind.into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: json!({}),
+            };
+            assert_eq!(
+                event.canonical_kind(),
+                expected,
+                "unexpected canonical kind for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_event_maps_native_prompt_and_stop_signals() {
+        let cases = [
+            (
+                "user-prompt-submit",
+                json!({}),
+                "session.prompt-submitted",
+                "prompt-submitted",
+            ),
+            (
+                "notify",
+                json!({"normalized_event": "prompt-delivered"}),
+                "session.prompt-delivered",
+                "prompt-delivered",
+            ),
+            (
+                "notify",
+                json!({"route_key": "first-prompt-delivery-failed"}),
+                "session.prompt-delivery-failed",
+                "prompt-delivery-failed",
+            ),
+            ("stop", json!({}), "session.stopped", "stopped"),
+        ];
+
+        for (kind, payload, expected_kind, expected_status) in cases {
+            let event = normalize_event(IncomingEvent {
+                kind: kind.into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload,
+            });
+            assert_eq!(event.kind, expected_kind);
+            assert_eq!(event.payload["status"], json!(expected_status));
+            assert_eq!(event.payload["normalized_event"], json!(expected_status));
+        }
     }
 }

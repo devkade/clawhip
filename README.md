@@ -27,15 +27,51 @@ Then OpenClaw should:
 - start the daemon
 - run live verification for issue / PR / git / tmux / install flows
 
-## What shipped in v0.4.0
+## What shipped in v0.3.0
 
-- **Install lifecycle polish** — repo-local installs, `clawhip install`, `clawhip update`, and `clawhip uninstall` are documented and aligned for clone-local operator workflows.
-- **Optional GitHub support prompt** — interactive install flows can offer an explicit opt-in GitHub star prompt, with `--skip-star-prompt` and `CLAWHIP_SKIP_STAR_PROMPT=1` available on both installer surfaces.
-- **Filesystem memory scaffolds** — `clawhip memory init` and `clawhip memory status` bootstrap and inspect the filesystem-offloaded memory layout for repos and workspaces.
-- **Native session contract polish** — OMC/OMX payload normalization now prefers the lower-noise `session.*` route family while keeping legacy `agent.*` compatibility.
-- **Config compatibility** — `[providers.discord]` remains the preferred config surface, while legacy `[discord]` still loads.
+- **Typed event model** — incoming events are normalized and validated into typed envelopes before dispatch.
+- **Multi-delivery router** — one event can resolve to zero, one, or many deliveries instead of stopping at the first match.
+- **Source extraction** — git, GitHub, and tmux monitoring now run as explicit sources feeding the daemon queue.
+- **Sink/render split** — rendering is separated from transport; v0.3.0 ships with the Discord sink and default renderer.
+- **Config compatibility** — `[providers.discord]` is the preferred config surface, while legacy `[discord]` still loads.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the release architecture that ships in v0.4.0.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the release architecture that ships in v0.3.0.
+
+## Provider-native hooks for Codex + Claude
+
+clawhip no longer treats provider-specific launch wrappers as the public integration surface.
+Codex and Claude own session launch plus hook registration; clawhip stays the routing,
+normalization, and delivery layer.
+
+Shared v1 hook events:
+
+- `SessionStart`
+- `PreToolUse`
+- `PostToolUse`
+- `UserPromptSubmit`
+- `Stop`
+
+Local ingress for sample payloads and manual verification:
+
+```bash
+clawhip native hook --provider codex --file payload.json
+clawhip native hook --provider claude --file payload.json
+cat payload.json | clawhip native hook --provider codex
+```
+
+Recommended installation model:
+
+- install the shared clawhip bridge in `~/.clawhip/hooks/native-hook.mjs`
+- for Codex, align with the official hook contract: use either `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`
+- for Claude Code, install the provider-native hook config globally in `~/.claude/settings.json`
+- keep provider config in the provider-owned config files
+- keep routing metadata in `.clawhip/project.json`
+- use `.clawhip/hooks/` only for additive augmentation such as frontmatter or recent context
+
+clawhip still pairs well with tmux when you want keyword/stale monitoring, but tmux is now
+optional and no longer the primary hook-registration surface.
+
+## Pi integration notes
 
 For planned Pi integration work, see [`docs/pi-integration-plan.md`](docs/pi-integration-plan.md).
 For Pi architecture context, see [`docs/pi-mono-architecture-notes.md`](docs/pi-mono-architecture-notes.md).
@@ -44,45 +80,15 @@ For the TUI-first observability contract, see [`docs/pi-tui-observability-contra
 For the first Pi session state model, see [`docs/pi-session-state-model.md`](docs/pi-session-state-model.md).
 For the file-by-file Pi state implementation plan, see [`docs/pi-session-state-implementation-plan.md`](docs/pi-session-state-implementation-plan.md).
 
-## Good to use together
-
-clawhip pairs well with coding session tools that run in tmux:
-
-### [OMX (oh-my-codex)](https://github.com/Yeachan-Heo/oh-my-codex)
-
-OpenAI Codex wrapper with auto-monitoring. Launch monitored coding sessions:
+For tmux-backed recovery into an already-running hooked session, use:
 
 ```bash
-clawhip tmux new -s issue-123 \
-  --channel YOUR_CHANNEL_ID \
-  --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete" \
-  -- 'source ~/.zshrc && omx --madmax'
-
-# or attach monitoring to an existing tmux session
-clawhip tmux watch -s issue-123 \
-  --channel YOUR_CHANNEL_ID \
-  --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete"
+clawhip deliver --session <tmux-session> --prompt "..." --max-enters 4
 ```
 
-See [`skills/omx/`](skills/omx/) for ready-to-use scripts.
-Native OMC/OMX routing now prefers the normalized [`session.*` contract](docs/native-event-contract.md); legacy `agent.*` wrapper emits remain supported for compatibility.
-
-### [OMC (oh-my-claudecode)](https://github.com/Yeachan-Heo/oh-my-claudecode)
-
-Claude Code wrapper with auto-monitoring. Launch monitored coding sessions:
-
-```bash
-clawhip tmux new -s issue-456 \
-  --channel YOUR_CHANNEL_ID \
-  --mention "<@your-user-id>" \
-  --keywords "error,PR created,complete" \
-  -- 'source ~/.zshrc && omc --openclaw --madmax'
-```
-
-See [`skills/omc/`](skills/omc/) for ready-to-use scripts.
-Direct Slack/Discord notifications inside OMC/OMX should be treated as deprecated; emit native events and let clawhip own routing, mention policy, and formatting.
+`clawhip deliver` validates repo-local prompt-submit hook setup, confirms the target pane is an
+active Codex/Claude (including OMC/OMX wrapper) session, then retries Enter until
+`.clawhip/state/prompt-submit.json` changes or the bounded retry limit is reached.
 
 ## Recipes
 
@@ -259,9 +265,17 @@ clawhip sends high-volume notifications (commits, PRs, tmux keyword alerts, stal
 [providers.discord]
 token = "your-dedicated-clawhip-bot-token"
 default_channel = "your-default-channel-id"
+
+[dispatch]
+routine_batch_window_secs = 5
+ci_batch_window_secs = 300
 ```
 
 Legacy `[discord]` config is still accepted and normalized at load time.
+
+`[dispatch].routine_batch_window_secs` controls the default Discord-only routine burst batch window. Leave it unset to keep the 5-second default, or set it to `0` to disable routine batching entirely. In v1, grouped routine bursts suppress route/event mentions for 2+ items, while explicit failure/stale/CI paths still bypass the routine batcher.
+
+`[dispatch].ci_batch_window_secs` controls how long clawhip waits before flushing a GitHub CI batch summary. Leave it unset to keep the 30-second default, or increase it for longer workflows that finish jobs over several minutes.
 
 ## Discord webhook setup
 
@@ -272,6 +286,25 @@ Quick start:
 ```bash
 clawhip setup --webhook "https://discord.com/api/webhooks/..."
 ```
+
+Bounded setup presets also support:
+
+```bash
+clawhip setup \
+  --bot-token "discord-bot-token" \
+  --default-channel "1234567890" \
+  --default-format alert \
+  --daemon-base-url "http://127.0.0.1:25294"
+```
+
+`clawhip setup` stays non-interactive and intentionally limited to five presets only:
+- Discord webhook quickstart route
+- Discord bot token
+- Default channel
+- Default message format
+- Daemon base URL
+
+Advanced routes and monitor definitions are still edited manually in the config file or revisited through the bounded `clawhip config` editor surface.
 
 Route example:
 
@@ -317,7 +350,7 @@ format = "alert"
               -> [Discord REST / Slack webhook delivery]
 ```
 
-Input sources in v0.4.0:
+Input sources in v0.3.0:
 - CLI thin clients and custom events
 - GitHub webhook ingress plus GitHub polling source
 - git monitor source
@@ -430,52 +463,45 @@ Verification:
 - create real empty commit in monitored repo
 - confirm final Discord body contains commit summary and mention
 
-### 7. Native OMC / OMX session contract
+### 7. Provider-native session contract
 
-Canonical native routing for OMC/OMX uses `session.*` events after clawhip normalization.
+Canonical native routing now starts from provider-native Codex and Claude hook payloads and
+enters clawhip through `clawhip native hook`.
 
-Accepted upstream inputs:
-- legacy wrapper emits like `agent.started` / `agent.finished` / `agent.failed`
-- OMC command/HTTP payloads with `signal.routeKey`
-- OMX hook payloads with `context.normalized_event`
+Shared v1 hook events:
+- `SessionStart`
+- `PreToolUse`
+- `PostToolUse`
+- `UserPromptSubmit`
+- `Stop`
 
-Canonical normalized events:
-- `session.started`
-- `session.blocked`
-- `session.finished`
-- `session.failed`
-- `session.retry-needed`
-- `session.pr-created`
-- `session.test-started`
-- `session.test-finished`
-- `session.test-failed`
-- `session.handoff-needed`
-
-Normalized metadata (when upstream provides it):
-- `tool`
-- `session_name`
+Stable routing metadata (when available):
+- `provider`
+- `event`
 - `session_id`
-- `repo_name`
-- `repo_path`
+- `directory`
 - `worktree_path`
+- `repo_name`
+- `project`
 - `branch`
-- `issue_number`
-- `pr_number`
-- `pr_url`
-- `command`
 - `tool_name`
-- `test_runner`
+- `command`
 - `summary`
-- `error_message`
 - `event_timestamp`
 
-Route guidance:
-- prefer `session.*` for new native OMC/OMX routes
-- `agent.*` remains supported for clawhip-local wrapper compatibility
-- `agent.started|blocked|finished|failed` and `session.started|blocked|finished|failed` cross-match in routing for backward compatibility
-- prefer route filters like `tool`, `repo_name`, `session_name`, `issue_number`, and `branch` over brittle message parsing
+Augmentation rules:
+- provider input + clawhip project metadata define the immutable base contract
+- `.clawhip/hooks/` scripts may only add fields or enrich message/context
+- augmenters must not remove or overwrite base routing keys
 
-See [`docs/native-event-contract.md`](docs/native-event-contract.md) for the full normalization/deprecation notes.
+Route guidance:
+- prefer filters like `provider`, `event`, `repo_name`, `project`, and `branch`
+- avoid route logic that depends on rendered message text
+- keep provider-specific extras out of the shared v1 route surface until explicitly adopted
+
+See [`docs/native-event-contract.md`](docs/native-event-contract.md) for the routing/augmentation
+guide and [`docs/event-contract-v1.md`](docs/event-contract-v1.md) for the frozen shared-event
+reference.
 
 ### 8. Agent lifecycle preset family
 
@@ -529,12 +555,18 @@ Verification:
 - let real tmux session idle past threshold
 - confirm final Discord body in target channel
 
-### 11. tmux wrapper / watch preset
+### 11. Provider-native sessions + tmux fallback
 
-Input:
+Preferred input:
+```bash
+clawhip native hook --provider codex --file payload.json
+clawhip native hook --provider claude --file payload.json
+clawhip tmux list
+```
+
+Fallback/debug input:
 ```bash
 clawhip tmux new -s <session> \
-  --channel <id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
@@ -546,26 +578,37 @@ clawhip tmux new -s <session> \
   -- command args
 
 clawhip tmux watch -s <existing-session> \
-  --channel <id> \
   --mention '<@id>' \
   --keywords 'error,PR created,FAILED,complete' \
   --stale-minutes 10 \
   --format alert \
   --retry-enter true
+
+clawhip deliver \
+  --session <existing-session> \
+  --prompt "continue from the latest blocker and open a PR to dev" \
+  --max-enters 4
 ```
 
 Behavior:
-- `tmux new` creates a tmux session using the user's default shell (or `--shell` override)
-- `tmux new` sends the requested command into the session, retrying Enter for TUI apps by default with exponential backoff (`--retry-enter=false` disables it, `--retry-enter-count` / `--retry-enter-delay-ms` tune retries)
-- `tmux watch` attaches monitoring to an already-running tmux session
-- both commands register the session with the daemon
-- daemon monitors keyword/stale events
-- final delivery goes through daemon routing
+- Codex and Claude should own session launch and hook registration
+- `clawhip native hook` is the local thin-client ingress for provider payloads
+- `tmux new` / `tmux watch` are fallback paths for debugging or manual recovery
+- `deliver` is the prompt recovery path for an already-running hooked tmux-backed provider session
+- `tmux list` shows active daemon-known watches with source, registration timestamp, and parent-process info
+- final delivery still goes through daemon routing
+- `deliver` refuses arbitrary shells and requires prompt-submit-aware hook setup (`clawhip hooks install --provider codex --scope global|project` for Codex, with the bridge in `~/.clawhip`, or `clawhip hooks install --provider claude-code --scope global` for Claude Code)
+
+Routing note:
+- session names are labels for operators, not routing authority
+- project metadata should be the source of truth for routing
+- broad prefix monitors like `clawhip*` are dangerous because they can overlap with launcher-registered watches and create stale/keyword noise
 
 Verification:
-- run wrapper or watch an existing session
-- emit keyword in pane
-- confirm Discord message body and mention
+- launch a real Codex or Claude session with provider-native hooks enabled
+- verify the tmux pane is actually alive
+- confirm routed delivery in Discord
+- if alert text conflicts with pane reality, trust the pane and inspect monitor registrations
 
 ### 12. install lifecycle preset
 
@@ -712,7 +755,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Yeachan-Heo/clawhip/rel
 
 This installs the latest prebuilt `clawhip` binary from GitHub Releases into `$CARGO_HOME/bin` (typically `~/.cargo/bin`).
 
-Release artifacts are generated for these Rust target triples: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`.
+Release artifacts are generated for these Rust target triples: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`.
 
 ### Repo-local install
 
@@ -756,6 +799,7 @@ Expected install path:
 Use:
 - `docs/live-verification.md`
 - `scripts/live-verify-default-presets.sh`
+- `scripts/internal-pr-format-gate.sh` for cheap local format gating before internal PR create/update flows
 
 Required live sign-off presets:
 - issue opened
@@ -765,7 +809,7 @@ Required live sign-off presets:
 - PR status changed
 - PR merged
 - git commit
-- agent started / blocked / finished / failed
+- provider-native shared hook events
 - tmux keyword
 - tmux stale
 - tmux wrapper
@@ -777,11 +821,28 @@ Required live sign-off presets:
 ```bash
 clawhip                 # start daemon
 clawhip status          # daemon health
-clawhip config          # config management
+clawhip config          # bounded preset editor / config inspection
 clawhip send ...        # thin client custom event
 clawhip github ...      # thin client GitHub event
 clawhip git ...         # thin client git event
 clawhip agent ...       # thin client agent lifecycle event
+clawhip native hook ... # provider-native hook thin client
 clawhip tmux ...        # thin client / wrapper surface
 clawhip plugin list     # list installed/bundled shell-hook plugins
 ```
+
+## Internal PR fast-path
+
+Before opening or updating an internal PR from a Rust worktree, run:
+
+```bash
+scripts/internal-pr-format-gate.sh
+```
+
+If you already know the tree just needs formatting, auto-fix first:
+
+```bash
+scripts/internal-pr-format-gate.sh --fix
+```
+
+This catches the cheapest class of red CI (`cargo fmt` only) locally before PR create/update churn.

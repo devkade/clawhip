@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use serde_json::json;
+
 use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
-use crate::events::{IncomingEvent, MessageFormat};
+use crate::events::{IncomingEvent, MessageFormat, RoutingMetadata};
+use crate::provenance::{DeliveryExplanation, FilterResult, Provenance, RouteExplanation};
 #[cfg(test)]
 use crate::render::DefaultRenderer;
 use crate::render::Renderer;
@@ -44,6 +47,7 @@ impl Router {
                 event_kind: event.canonical_kind().to_string(),
                 format: delivery.format.clone(),
                 content,
+                payload: event.payload.clone(),
             };
             if let Err(error) = sink.send(&delivery.target, &message).await {
                 eprintln!(
@@ -119,25 +123,34 @@ impl Router {
         delivery: &ResolvedDelivery,
         renderer: &R,
     ) -> Result<String> {
-        let content = if let Some(template) = delivery.template.as_deref() {
-            dynamic_tokens::render_template(
-                template,
-                &event.template_context(),
-                delivery.allow_dynamic_tokens,
-            )
-            .await
-        } else {
-            let rendered = renderer.render(event, &delivery.format)?;
-            if delivery.allow_dynamic_tokens {
-                dynamic_tokens::render_template(&rendered, &event.template_context(), true).await
-            } else {
-                rendered
-            }
-        };
+        let content = self.render_delivery_body(event, delivery, renderer).await?;
 
         match delivery.mention.as_deref().map(str::trim) {
             Some(mention) if !mention.is_empty() => Ok(format!("{mention} {content}")),
             _ => Ok(content),
+        }
+    }
+
+    pub async fn render_delivery_body<R: Renderer + ?Sized>(
+        &self,
+        event: &IncomingEvent,
+        delivery: &ResolvedDelivery,
+        renderer: &R,
+    ) -> Result<String> {
+        if let Some(template) = delivery.template.as_deref() {
+            return Ok(dynamic_tokens::render_template(
+                template,
+                &event.template_context(),
+                delivery.allow_dynamic_tokens,
+            )
+            .await);
+        }
+
+        let rendered = renderer.render(event, &delivery.format)?;
+        if delivery.allow_dynamic_tokens {
+            Ok(dynamic_tokens::render_template(&rendered, &event.template_context(), true).await)
+        } else {
+            Ok(rendered)
         }
     }
 
@@ -173,22 +186,100 @@ impl Router {
 
     fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
         let context = event.template_context();
-        let candidates = route_candidates(event.canonical_kind());
-        self.config
-            .routes
-            .iter()
-            .filter(|route| {
-                candidates
-                    .iter()
-                    .any(|candidate| glob_match(&route.event, candidate))
-                    && route.filter.iter().all(|(key, expected)| {
-                        context
-                            .get(key)
-                            .map(|actual| glob_match(expected, actual))
-                            .unwrap_or(false)
-                    })
-            })
-            .collect()
+        matching_routes_for(&self.config.routes, event.canonical_kind(), &context)
+    }
+
+    /// Produce a full provenance trace explaining how an event would be routed.
+    ///
+    /// Unlike [`resolve`](Self::resolve) this evaluates *every* configured route
+    /// and returns detailed match/mismatch reasons, so operators can answer
+    /// "what emitted this message and why".
+    pub fn explain(&self, event: &IncomingEvent) -> Provenance {
+        let canonical_kind = event.canonical_kind().to_string();
+        let context = event.template_context();
+        let candidates: Vec<String> = route_candidates(&canonical_kind)
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let mut route_explanations = Vec::with_capacity(self.config.routes.len());
+        let mut matched_indices = Vec::new();
+
+        for (index, route) in self.config.routes.iter().enumerate() {
+            let pattern_matched = candidates
+                .iter()
+                .any(|candidate| glob_match(&route.event, candidate));
+
+            let filter_results: Vec<FilterResult> = route
+                .filter
+                .iter()
+                .map(|(key, expected)| {
+                    let actual = context.get(key).cloned();
+                    let matched = actual
+                        .as_ref()
+                        .map(|a| glob_match(expected, a))
+                        .unwrap_or(false);
+                    FilterResult {
+                        key: key.clone(),
+                        pattern: expected.clone(),
+                        actual,
+                        matched,
+                    }
+                })
+                .collect();
+
+            let all_filters_match =
+                filter_results.is_empty() || filter_results.iter().all(|f| f.matched);
+            let matched = pattern_matched && all_filters_match;
+
+            if matched {
+                matched_indices.push(index);
+            }
+
+            route_explanations.push(RouteExplanation {
+                route_index: index,
+                event_pattern: route.event.clone(),
+                matched,
+                pattern_matched,
+                filter_results,
+            });
+        }
+
+        let ordered_matched_indices: Vec<usize> =
+            matching_routes_for(&self.config.routes, &canonical_kind, &context)
+                .into_iter()
+                .filter_map(|matched_route| {
+                    self.config
+                        .routes
+                        .iter()
+                        .position(|route| std::ptr::eq(route, matched_route))
+                })
+                .collect();
+
+        let deliveries = if ordered_matched_indices.is_empty() {
+            match self.resolve_delivery(event, None) {
+                Ok(d) => vec![delivery_explanation(&d, None)],
+                Err(_) => vec![],
+            }
+        } else {
+            ordered_matched_indices
+                .iter()
+                .filter_map(|&idx| {
+                    let route = &self.config.routes[idx];
+                    self.resolve_delivery(event, Some(route))
+                        .ok()
+                        .map(|d| delivery_explanation(&d, Some(idx)))
+                })
+                .collect()
+        };
+
+        Provenance {
+            event_kind: event.kind.clone(),
+            canonical_kind,
+            route_candidates: candidates,
+            routes: route_explanations,
+            deliveries,
+        }
     }
 
     fn target_for(
@@ -203,14 +294,24 @@ impl Router {
                     return Ok(SinkTarget::DiscordWebhook(webhook.to_string()));
                 }
 
-                let channel = event
-                    .channel
-                    .clone()
-                    .or_else(|| route.and_then(|route| route.channel.clone()))
-                    .or_else(|| self.config.defaults.channel.clone())
-                    .ok_or_else(|| {
-                        format!("no channel configured for event {}", event.canonical_kind())
-                    })?;
+                // For custom events (e.g. `clawhip send --channel X`), the
+                // event-level channel represents explicit user intent and must
+                // take highest priority — above both route and default channels.
+                let channel = if event.canonical_kind() == "custom" {
+                    event
+                        .channel
+                        .clone()
+                        .or_else(|| route.and_then(|route| route.channel.clone()))
+                        .or_else(|| self.config.defaults.channel.clone())
+                } else {
+                    route
+                        .and_then(|route| route.channel.clone())
+                        .or_else(|| event.channel.clone())
+                        .or_else(|| self.config.defaults.channel.clone())
+                }
+                .ok_or_else(|| {
+                    format!("no channel configured for event {}", event.canonical_kind())
+                })?;
 
                 Ok(SinkTarget::DiscordChannel(channel))
             }
@@ -230,6 +331,92 @@ impl Router {
             )
             .into()),
         }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_tmux_session_channel(
+    config: &AppConfig,
+    session_name: &str,
+) -> Option<String> {
+    resolve_tmux_session_channel_with_metadata(config, session_name, &RoutingMetadata::default())
+}
+
+pub(crate) fn resolve_tmux_session_channel_with_metadata(
+    config: &AppConfig,
+    session_name: &str,
+    routing: &RoutingMetadata,
+) -> Option<String> {
+    let tmux_context =
+        IncomingEvent::tmux_keyword(session_name.to_string(), String::new(), String::new(), None)
+            .with_routing_metadata(routing)
+            .template_context();
+    let session_context = IncomingEvent {
+        kind: "session.started".to_string(),
+        channel: None,
+        mention: None,
+        format: None,
+        template: None,
+        payload: json!({
+            "session_name": session_name,
+            "session": session_name,
+            "tool": "tmux",
+        }),
+    }
+    .with_routing_metadata(routing)
+    .template_context();
+    let prefer_metadata = prefers_metadata_first_routing("tmux.keyword", &tmux_context)
+        || prefers_metadata_first_routing("session.started", &session_context);
+    let mut preferred = Vec::new();
+    let mut heuristic = Vec::new();
+
+    for route in config.routes.iter().filter(|route| {
+        route_matches(route, "tmux.keyword", &tmux_context)
+            || route_matches(route, "session.started", &session_context)
+    }) {
+        if prefer_metadata && route_uses_session_name_prefix_heuristics(route) {
+            heuristic.push(route);
+        } else {
+            preferred.push(route);
+        }
+    }
+
+    if !prefer_metadata {
+        preferred.extend(heuristic);
+    }
+
+    for route in preferred {
+        if route.effective_sink() != "discord" {
+            continue;
+        }
+        if let Some(channel) = route_channel(route) {
+            return Some(channel.to_string());
+        }
+    }
+
+    config.defaults.channel.clone()
+}
+
+fn delivery_explanation(
+    delivery: &ResolvedDelivery,
+    matched_route_index: Option<usize>,
+) -> DeliveryExplanation {
+    let (target_label, channel) = match &delivery.target {
+        SinkTarget::DiscordChannel(name) => {
+            (format!("DiscordChannel({name:?})"), Some(name.clone()))
+        }
+        SinkTarget::DiscordWebhook(url) => (format!("DiscordWebhook({url})"), None),
+        SinkTarget::SlackWebhook(url) => (format!("SlackWebhook({url})"), None),
+    };
+
+    DeliveryExplanation {
+        sink: delivery.sink.clone(),
+        target: target_label,
+        channel,
+        format: delivery.format.as_str().to_string(),
+        mention: delivery.mention.clone(),
+        template: delivery.template.clone(),
+        matched_route_index,
     }
 }
 
@@ -255,7 +442,121 @@ fn route_candidates(kind: &str) -> Vec<&str> {
     }
 }
 
-fn glob_match(pattern: &str, value: &str) -> bool {
+fn route_matches(
+    route: &RouteRule,
+    canonical_kind: &str,
+    context: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    route_candidates(canonical_kind)
+        .iter()
+        .any(|candidate| glob_match(&route.event, candidate))
+        && route.filter.iter().all(|(key, expected)| {
+            context
+                .get(key)
+                .map(|actual| glob_match(expected, actual))
+                .unwrap_or(false)
+        })
+}
+
+fn matching_routes_for<'a>(
+    routes: &'a [RouteRule],
+    canonical_kind: &str,
+    context: &std::collections::BTreeMap<String, String>,
+) -> Vec<&'a RouteRule> {
+    let prefer_metadata = prefers_metadata_first_routing(canonical_kind, context);
+    let mut preferred = Vec::new();
+    let mut heuristic = Vec::new();
+
+    for route in routes
+        .iter()
+        .filter(|route| route_matches(route, canonical_kind, context))
+    {
+        if prefer_metadata && route_uses_session_name_prefix_heuristics(route) {
+            heuristic.push(route);
+        } else {
+            preferred.push(route);
+        }
+    }
+
+    preferred.sort_by(|left, right| {
+        route_specificity_score(right, context).cmp(&route_specificity_score(left, context))
+    });
+    heuristic.sort_by(|left, right| {
+        route_specificity_score(right, context).cmp(&route_specificity_score(left, context))
+    });
+
+    if !prefer_metadata {
+        preferred.extend(heuristic);
+    }
+
+    preferred
+}
+
+fn route_specificity_score(
+    route: &RouteRule,
+    context: &std::collections::BTreeMap<String, String>,
+) -> usize {
+    let path_rank = if route.filter.contains_key("worktree_path")
+        && context
+            .get("worktree_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        3
+    } else if route.filter.contains_key("repo_path")
+        && context
+            .get("repo_path")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        2
+    } else if route.filter.contains_key("repo_name")
+        && context
+            .get("repo_name")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        1
+    } else {
+        0
+    };
+
+    (path_rank * 100) + route.filter.len()
+}
+
+fn prefers_metadata_first_routing(
+    canonical_kind: &str,
+    context: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    if !(canonical_kind.starts_with("session.") || canonical_kind.starts_with("tmux.")) {
+        return false;
+    }
+
+    [
+        "project",
+        "repo_name",
+        "repo_path",
+        "worktree_path",
+        "session_id",
+    ]
+    .into_iter()
+    .filter_map(|key| context.get(key))
+    .any(|value| !value.trim().is_empty())
+}
+
+fn route_uses_session_name_prefix_heuristics(route: &RouteRule) -> bool {
+    !route.filter.is_empty()
+        && route.filter.iter().all(|(key, expected)| {
+            matches!(key.as_str(), "session" | "session_name") && expected.contains('*')
+        })
+}
+
+fn route_channel(route: &RouteRule) -> Option<&str> {
+    route
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
+}
+
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     if pattern == value {
         return true;
     }
@@ -299,16 +600,18 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{DefaultsConfig, RouteRule};
-    use crate::events::normalize_event;
+    use crate::events::{RoutingMetadata, normalize_event};
     use crate::render::DefaultRenderer;
     use crate::sink::{DiscordSink, SlackSink};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn resolve_returns_all_matching_deliveries_in_route_order() {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![
@@ -317,6 +620,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: Some("ops".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: Some("@ops".into()),
@@ -329,6 +633,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: Some("eng".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: Some("@eng".into()),
@@ -374,6 +679,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("fallback".into()),
+                channel_name: None,
                 format: MessageFormat::Alert,
             },
             routes: vec![RouteRule {
@@ -381,6 +687,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("github".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -442,6 +749,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    channel_name: None,
                     webhook: Some(failing_webhook),
                     slack_webhook: None,
                     mention: None,
@@ -454,6 +762,7 @@ mod tests {
                     sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
+                    channel_name: None,
                     webhook: Some(successful_webhook),
                     slack_webhook: None,
                     mention: None,
@@ -488,6 +797,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -497,6 +807,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -520,10 +831,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_matches_git_routes_on_worktree_path() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: [("worktree_path".to_string(), "*/issue-115".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("worktrees".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "feat/issue-115".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        )
+        .with_repo_context(
+            Some("/repo/clawhip".into()),
+            Some("/repo/.worktrees/issue-115".into()),
+        );
+
+        let (channel, format, content) = router.preview(&event).await.unwrap();
+        assert_eq!(channel, "worktrees");
+        assert_eq!(format, MessageFormat::Compact);
+        assert_eq!(
+            content,
+            "git:clawhip[wt:issue-115]@feat/issue-115 1234567 ship it"
+        );
+    }
+
+    #[tokio::test]
     async fn route_level_mention_is_prepended_for_custom() {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -531,6 +890,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: Some("<@1465264645320474637>".into()),
@@ -552,6 +912,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![
@@ -562,6 +923,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("gh-route".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: Some("<@botid>".into()),
@@ -576,6 +938,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("tmux-route".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: Some("<@botid>".into()),
@@ -606,6 +969,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -613,6 +977,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -633,6 +998,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -640,6 +1006,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("dynamic-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -660,6 +1027,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -669,6 +1037,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("tmux-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -695,6 +1064,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -702,6 +1072,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: Some("tmux-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: Some("<@route>".into()),
@@ -726,6 +1097,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -735,6 +1107,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: Some("<@route>".into()),
@@ -763,6 +1136,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -772,6 +1146,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: Some("<@route>".into()),
@@ -808,6 +1183,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -817,6 +1193,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("agent-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -863,10 +1240,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_agent_events_match_session_routes() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                filter: [
+                    ("tool".to_string(), "omx".to_string()),
+                    ("project".to_string(), "clawhip".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                channel: Some("session-route".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = normalize_event(IncomingEvent::agent_finished(
+            "omx".into(),
+            Some("issue-65".into()),
+            Some("clawhip".into()),
+            Some(42),
+            Some("PR created".into()),
+            None,
+            None,
+        ));
+
+        let (channel, format, content) = router.preview(&event).await.unwrap();
+
+        assert_eq!(channel, "session-route");
+        assert_eq!(format, MessageFormat::Compact);
+        assert!(content.contains("agent omx"));
+        assert!(content.contains("finished"));
+    }
+
+    #[tokio::test]
+    async fn native_omc_session_events_match_session_routes() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                sink: "discord".into(),
+                filter: [
+                    ("tool".to_string(), "omc".to_string()),
+                    ("repo_name".to_string(), "clawhip".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                channel: Some("session-route".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = normalize_event(IncomingEvent {
+            kind: "post-tool-use".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "timestamp": "2026-03-09T18:01:58.000Z",
+                "signal": {
+                    "routeKey": "pull-request.created",
+                    "phase": "finished",
+                    "summary": "https://github.com/Yeachan-Heo/clawhip/pull/67"
+                },
+                "context": {
+                    "sessionId": "issue-65",
+                    "projectPath": "/repo/clawhip-worktrees/issue-65",
+                    "projectName": "clawhip"
+                }
+            }),
+        });
+
+        let (channel, format, content) = router.preview(&event).await.unwrap();
+
+        assert_eq!(channel, "session-route");
+        assert_eq!(format, MessageFormat::Compact);
+        assert!(content.contains("omc issue-65 pr-created"));
+        assert!(content.contains("repo=clawhip"));
+        assert!(content.contains("pr=#67"));
+    }
+
+    #[tokio::test]
     async fn session_lifecycle_events_match_existing_agent_routes() {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -879,6 +1363,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 channel: Some("agent-route".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: None,
@@ -916,6 +1401,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![
@@ -926,6 +1412,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("repo-a".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: None,
@@ -940,6 +1427,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                     channel: Some("repo-b".into()),
+                    channel_name: None,
                     webhook: None,
                     slack_webhook: None,
                     mention: None,
@@ -957,10 +1445,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_and_github_routes_can_filter_on_repo_name_alias() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: [("repo_name".to_string(), "clawhip".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("repo-name-route".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        );
+
+        let (channel, _, _) = router.preview(&event).await.unwrap();
+        assert_eq!(channel, "repo-name-route");
+    }
+
+    #[tokio::test]
+    async fn tmux_and_session_routes_share_session_alias_filters() {
+        let tmux_config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: [("session_name".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("tmux-session-name".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let tmux_router = Router::new(Arc::new(tmux_config));
+        let tmux_event =
+            IncomingEvent::tmux_keyword("issue-132".into(), "error".into(), "boom".into(), None);
+        let (tmux_channel, _, _) = tmux_router.preview(&tmux_event).await.unwrap();
+        assert_eq!(tmux_channel, "tmux-session-name");
+
+        let session_config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.started".into(),
+                sink: "discord".into(),
+                filter: [("session".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("session-alias-route".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let session_router = Router::new(Arc::new(session_config));
+        let session_event = IncomingEvent {
+            kind: "session.started".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session_name": "issue-132",
+                "tool": "omx"
+            }),
+        };
+
+        let (session_channel, _, _) = session_router.preview(&session_event).await.unwrap();
+        assert_eq!(session_channel, "session-alias-route");
+    }
+
+    #[tokio::test]
+    async fn tmux_routes_prefer_repo_metadata_over_session_prefix_heuristics() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.*".into(),
+                    sink: "discord".into(),
+                    filter: [("session_name".to_string(), "clawhip-*".to_string())]
+                        .into_iter()
+                        .collect(),
+                    channel: Some("heuristic-route".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.*".into(),
+                    sink: "discord".into(),
+                    filter: [("repo_name".to_string(), "clawhip".to_string())]
+                        .into_iter()
+                        .collect(),
+                    channel: Some("metadata-route".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "clawhip-issue-152".into(),
+            "error".into(),
+            "boom".into(),
+            None,
+        )
+        .with_routing_metadata(&RoutingMetadata {
+            repo_name: Some("clawhip".into()),
+            project: Some("clawhip".into()),
+            worktree_path: Some("/repo/clawhip.worktrees/issue-152".into()),
+            ..RoutingMetadata::default()
+        });
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(
+            deliveries.first().map(|delivery| &delivery.target),
+            Some(&SinkTarget::DiscordChannel("metadata-route".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_routes_prefer_repo_metadata_over_session_prefix_heuristics() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "session.*".into(),
+                    sink: "discord".into(),
+                    filter: [("session_name".to_string(), "clawhip-*".to_string())]
+                        .into_iter()
+                        .collect(),
+                    channel: Some("heuristic-route".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "session.*".into(),
+                    sink: "discord".into(),
+                    filter: [("repo_name".to_string(), "clawhip".to_string())]
+                        .into_iter()
+                        .collect(),
+                    channel: Some("metadata-route".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = normalize_event(IncomingEvent {
+            kind: "session.started".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session_name": "clawhip-issue-152",
+                "repo_name": "clawhip",
+                "worktree_path": "/repo/clawhip.worktrees/issue-152",
+            }),
+        });
+
+        let deliveries = router.resolve(&event).await.unwrap();
+        assert_eq!(
+            deliveries.first().map(|delivery| &delivery.target),
+            Some(&SinkTarget::DiscordChannel("metadata-route".into()))
+        );
+    }
+
+    #[tokio::test]
     async fn webhook_route_is_used_as_delivery_target() {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -968,6 +1668,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: None,
+                channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
                 mention: None,
@@ -1000,6 +1701,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -1007,6 +1709,7 @@ mod tests {
                 sink: "discord".into(),
                 filter: Default::default(),
                 channel: None,
+                channel_name: None,
                 webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
                 slack_webhook: None,
                 mention: None,
@@ -1032,10 +1735,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_channel_takes_precedence_over_event_channel() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("route-channel".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "issue-25".into(),
+            "error".into(),
+            "boom".into(),
+            Some("launcher-channel".into()),
+        );
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("route-channel".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn event_channel_is_used_when_matching_route_has_no_channel() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: None,
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: Some("<@route>".into()),
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::tmux_keyword(
+            "issue-25".into(),
+            "error".into(),
+            "boom".into(),
+            Some("monitor-channel".into()),
+        );
+
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("monitor-channel".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_event_channel_takes_precedence_over_route_channel() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default-ch".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("route-ch".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        // clawhip send --channel user-target --message "hello"
+        let event = IncomingEvent::custom(Some("user-target".into()), "hello".into());
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("user-target".into()),
+            "custom event channel (from --channel flag) must override route channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_event_without_channel_falls_back_to_route_then_default() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default-ch".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "custom".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("route-ch".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        // clawhip send --message "hello" (no --channel)
+        let event = IncomingEvent::custom(None, "hello".into());
+        let delivery = router.preview_delivery(&event).await.unwrap();
+        assert_eq!(
+            delivery.target,
+            SinkTarget::DiscordChannel("route-ch".into()),
+            "custom event without explicit channel should fall back to route channel"
+        );
+    }
+
+    #[tokio::test]
     async fn slack_webhook_route_is_used_as_delivery_target() {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("default".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -1089,6 +1939,173 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_tmux_session_channel_prefers_matching_tmux_route() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("xeroclaw-dev")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_supports_session_routes() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.*".into(),
+                filter: BTreeMap::from([("session_name".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: Some("xeroclaw-dev".into()),
+                channel_name: None,
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("xeroclaw-dev")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_with_metadata_prefers_repo_route_over_prefix_heuristic() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.*".into(),
+                    filter: BTreeMap::from([("session".into(), "clawhip-*".into())]),
+                    sink: "discord".into(),
+                    channel: Some("heuristic-route".into()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.*".into(),
+                    filter: BTreeMap::from([("repo_name".into(), "clawhip".into())]),
+                    sink: "discord".into(),
+                    channel: Some("metadata-route".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel_with_metadata(
+                &config,
+                "clawhip-issue-152",
+                &RoutingMetadata {
+                    repo_name: Some("clawhip".into()),
+                    project: Some("clawhip".into()),
+                    worktree_path: Some("/repo/clawhip.worktrees/issue-152".into()),
+                    ..RoutingMetadata::default()
+                }
+            )
+            .as_deref(),
+            Some("metadata-route")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_with_metadata_does_not_fallback_to_prefix_heuristics() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "clawhip-*".into())]),
+                sink: "discord".into(),
+                channel: Some("heuristic-route".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel_with_metadata(
+                &config,
+                "clawhip-issue-152",
+                &RoutingMetadata {
+                    repo_name: Some("clawhip".into()),
+                    project: Some("clawhip".into()),
+                    worktree_path: Some("/repo/clawhip.worktrees/issue-152".into()),
+                    ..RoutingMetadata::default()
+                }
+            )
+            .as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_session_channel_skips_webhooks_and_falls_back_to_defaults() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.*".into(),
+                filter: BTreeMap::from([("session".into(), "xeroclaw-*".into())]),
+                sink: "discord".into(),
+                channel: None,
+                channel_name: None,
+                webhook: Some("https://discord.com/api/webhooks/123/abc".into()),
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            resolve_tmux_session_channel(&config, "xeroclaw-42").as_deref(),
+            Some("default")
+        );
+    }
+
     #[tokio::test]
     async fn slack_dispatch_posts_block_kit_payload() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1131,5 +2148,225 @@ mod tests {
             .unwrap();
         assert!(request.contains("\"text\":\"hello from clawhip\""));
         assert!(request.contains("\"blocks\""));
+    }
+
+    // ── explain / provenance ─────────────────────────────────────
+
+    #[test]
+    fn explain_shows_matched_route_with_filter_details() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("repo_name".into(), "clawhip".into())]),
+                channel: Some("commits".into()),
+                mention: Some("@devs".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "abc123".into(),
+            "ship it".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.canonical_kind, "git.commit");
+        assert!(
+            provenance
+                .route_candidates
+                .contains(&"git.commit".to_string())
+        );
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(provenance.routes[0].matched);
+        assert!(provenance.routes[0].pattern_matched);
+        assert_eq!(provenance.routes[0].filter_results.len(), 1);
+        assert!(provenance.routes[0].filter_results[0].matched);
+        assert_eq!(provenance.routes[0].filter_results[0].key, "repo_name");
+        assert_eq!(
+            provenance.routes[0].filter_results[0].actual.as_deref(),
+            Some("clawhip")
+        );
+        assert_eq!(provenance.deliveries.len(), 1);
+        assert_eq!(provenance.deliveries[0].matched_route_index, Some(0));
+        assert_eq!(provenance.deliveries[0].sink, "discord");
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("commits"));
+    }
+
+    #[test]
+    fn explain_reports_filter_mismatch() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: BTreeMap::from([("branch".into(), "main".into())]),
+                channel: Some("commits".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "feature".into(),
+            "abc123".into(),
+            "wip".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(!provenance.routes[0].matched);
+        assert!(provenance.routes[0].pattern_matched);
+        assert!(!provenance.routes[0].filter_results[0].matched);
+        assert_eq!(
+            provenance.routes[0].filter_results[0].actual.as_deref(),
+            Some("feature")
+        );
+        // Falls through to default
+        assert_eq!(provenance.deliveries.len(), 1);
+        assert_eq!(provenance.deliveries[0].matched_route_index, None);
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn explain_pattern_mismatch_skips_route() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "github.*".into(),
+                sink: "discord".into(),
+                channel: Some("github".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("dev".into(), "error".into(), "segfault".into(), None);
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 1);
+        assert!(!provenance.routes[0].matched);
+        assert!(!provenance.routes[0].pattern_matched);
+        assert_eq!(provenance.deliveries[0].matched_route_index, None);
+    }
+
+    #[test]
+    fn explain_multi_route_match_produces_multiple_deliveries() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "discord".into(),
+                    channel: Some("ops".into()),
+                    mention: Some("@ops".into()),
+                    format: Some(MessageFormat::Alert),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "tmux.*".into(),
+                    sink: "discord".into(),
+                    channel: Some("eng".into()),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-42".into(), "error".into(), "boom".into(), None);
+
+        let provenance = router.explain(&event);
+
+        assert_eq!(provenance.routes.len(), 2);
+        assert!(provenance.routes[0].matched);
+        assert!(provenance.routes[1].matched);
+        assert_eq!(provenance.deliveries.len(), 2);
+        assert_eq!(provenance.deliveries[0].matched_route_index, Some(0));
+        assert_eq!(provenance.deliveries[0].channel.as_deref(), Some("ops"));
+        assert_eq!(provenance.deliveries[1].matched_route_index, Some(1));
+        assert_eq!(provenance.deliveries[1].channel.as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn explain_no_routes_and_no_default_produces_empty_deliveries() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: None,
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "orphan".into());
+
+        let provenance = router.explain(&event);
+
+        assert!(provenance.routes.is_empty());
+        assert!(provenance.deliveries.is_empty());
+    }
+
+    #[test]
+    fn explain_json_serialization_roundtrips() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("general".into()),
+                channel_name: None,
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                channel: Some("commits".into()),
+                ..RouteRule::default()
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "repo".into(),
+            "main".into(),
+            "abc".into(),
+            "msg".into(),
+            None,
+        );
+
+        let provenance = router.explain(&event);
+        let json = serde_json::to_string(&provenance).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["canonical_kind"], "git.commit");
+        assert!(parsed["routes"].is_array());
+        assert!(parsed["deliveries"].is_array());
+        assert_eq!(parsed["deliveries"][0]["sink"], "discord");
     }
 }

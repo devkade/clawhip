@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -11,7 +12,7 @@ use crate::Result;
 use crate::config::{AppConfig, GitRepoMonitor};
 use crate::events::IncomingEvent;
 use crate::source::Source;
-use crate::source::git::{GitSnapshot, snapshot_git_repo};
+use crate::source::git::{GitSnapshot, repo_display_name, snapshot_git_repo};
 
 pub struct GitHubSource {
     config: Arc<AppConfig>,
@@ -40,13 +41,13 @@ impl Source for GitHubSource {
         let mut state = HashMap::new();
 
         loop {
-            poll_github(
+            run_github_poll_cycle(
                 self.config.as_ref(),
                 github_client.as_ref(),
                 &tx,
                 &mut state,
             )
-            .await?;
+            .await;
             sleep(Duration::from_secs(
                 self.config.monitors.poll_interval_secs.max(1),
             ))
@@ -86,10 +87,16 @@ struct GitHubCISnapshot {
     sha: String,
     url: String,
     branch: Option<String>,
+    run_id: Option<String>,
+    run_job_count: usize,
+    run_all_terminal: bool,
 }
 
 impl GitHubCISnapshot {
     fn dedupe_key(&self) -> String {
+        if let Some(run_id) = &self.run_id {
+            return format!("run:{run_id}:{}", self.workflow);
+        }
         format!(
             "{}:{}:{}",
             self.pr_number
@@ -105,6 +112,41 @@ impl GitHubCISnapshot {
     }
 }
 
+async fn run_github_poll_cycle(
+    config: &AppConfig,
+    github_client: Option<&reqwest::Client>,
+    tx: &mpsc::Sender<IncomingEvent>,
+    state: &mut HashMap<String, GitHubRepoState>,
+) {
+    if let Err(error) = poll_github(config, github_client, tx, state).await {
+        eprintln!("clawhip source github poll failed: {error}");
+    }
+}
+
+async fn snapshot_github_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
+    match snapshot_git_repo(repo).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => match repo.github_repo.clone() {
+            Some(github_repo) => {
+                eprintln!(
+                    "clawhip source github snapshot failed for {}: {error}; using configured github_repo={github_repo}",
+                    repo.path
+                );
+                Ok(GitSnapshot {
+                    repo_name: repo_display_name(repo),
+                    repo_path: repo.path.clone(),
+                    worktree_path: repo.path.clone(),
+                    branch: String::new(),
+                    head: String::new(),
+                    commits: Vec::new(),
+                    github_repo: Some(github_repo),
+                })
+            }
+            None => Err(error),
+        },
+    }
+}
+
 async fn poll_github(
     config: &AppConfig,
     github_client: Option<&reqwest::Client>,
@@ -116,7 +158,7 @@ async fn poll_github(
             continue;
         }
 
-        let snapshot = match snapshot_git_repo(repo).await {
+        let snapshot = match snapshot_github_repo(repo).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 eprintln!(
@@ -128,10 +170,41 @@ async fn poll_github(
         };
 
         let previous = state.get(&repo.path);
-        let issues = poll_issues(config, github_client, repo, &snapshot, previous, tx).await?;
-        let prs = poll_pull_requests(config, github_client, repo, &snapshot, previous, tx).await?;
-        let ci =
-            poll_ci_statuses(config, github_client, repo, &snapshot, previous, &prs, tx).await?;
+        let issues = match poll_issues(config, github_client, repo, &snapshot, previous, tx).await {
+            Ok(issues) => issues,
+            Err(error) => {
+                eprintln!(
+                    "clawhip source GitHub issue processing failed for {}: {error}",
+                    repo.path
+                );
+                previous
+                    .map(|entry| entry.issues.clone())
+                    .unwrap_or_default()
+            }
+        };
+        let prs =
+            match poll_pull_requests(config, github_client, repo, &snapshot, previous, tx).await {
+                Ok(prs) => prs,
+                Err(error) => {
+                    eprintln!(
+                        "clawhip source GitHub pull request processing failed for {}: {error}",
+                        repo.path
+                    );
+                    previous.map(|entry| entry.prs.clone()).unwrap_or_default()
+                }
+            };
+        let ci = match poll_ci_statuses(config, github_client, repo, &snapshot, previous, &prs, tx)
+            .await
+        {
+            Ok(ci) => ci,
+            Err(error) => {
+                eprintln!(
+                    "clawhip source GitHub CI processing failed for {}: {error}",
+                    repo.path
+                );
+                previous.map(|entry| entry.ci.clone()).unwrap_or_default()
+            }
+        };
 
         state.insert(repo.path.clone(), GitHubRepoState { issues, prs, ci });
     }
@@ -259,9 +332,6 @@ async fn poll_ci_statuses(
         .filter(|(_, pr)| pr.status == "open")
         .map(|(number, pr)| (*number, pr))
         .collect::<Vec<_>>();
-    if open_prs.is_empty() {
-        return Ok(HashMap::new());
-    }
 
     match fetch_ci_statuses(
         client,
@@ -273,10 +343,10 @@ async fn poll_ci_statuses(
     .await
     {
         Ok(ci) => {
-            let empty = HashMap::new();
-            let previous_ci = previous.map(|entry| &entry.ci).unwrap_or(&empty);
-            for event in collect_ci_events(repo, &snapshot.repo_name, previous_ci, &ci) {
-                send_event(tx, event).await?;
+            if let Some(previous) = previous {
+                for event in collect_ci_events(repo, &snapshot.repo_name, &previous.ci, &ci) {
+                    send_event(tx, event).await?;
+                }
             }
             Ok(ci)
         }
@@ -294,6 +364,33 @@ async fn send_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> R
     tx.send(event)
         .await
         .map_err(|error| format!("github source channel closed: {error}").into())
+}
+
+async fn github_get(
+    client: &reqwest::Client,
+    api_base: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    context: &str,
+) -> Result<reqwest::Response> {
+    let url = format!(
+        "{}/{}",
+        api_base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    eprintln!("clawhip source github: GET {url} ({context})");
+
+    let response = client.get(&url).query(query).send().await?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        eprintln!("clawhip source github: GET {url} ({context}) failed with {status}: {body}");
+        return Err(format!("GitHub API request failed with {status}: {body}").into());
+    }
+
+    eprintln!("clawhip source github: GET {url} ({context}) -> {status}");
+    Ok(response)
 }
 
 fn collect_issue_events(
@@ -363,22 +460,28 @@ fn collect_ci_events(
             continue;
         }
 
-        events.push(
-            IncomingEvent::github_ci(
-                ci.event_kind(),
-                repo_name.to_string(),
-                ci.pr_number,
-                ci.workflow.clone(),
-                ci.status.clone(),
-                ci.conclusion.clone(),
-                ci.sha.clone(),
-                ci.url.clone(),
-                ci.branch.clone(),
-                repo.channel.clone(),
-            )
-            .with_mention(repo.mention.clone())
-            .with_format(repo.format.clone()),
-        );
+        let mut event = IncomingEvent::github_ci(
+            ci.event_kind(),
+            repo_name.to_string(),
+            ci.pr_number,
+            ci.workflow.clone(),
+            ci.status.clone(),
+            ci.conclusion.clone(),
+            ci.sha.clone(),
+            ci.url.clone(),
+            ci.branch.clone(),
+            repo.channel.clone(),
+        )
+        .with_mention(repo.mention.clone())
+        .with_format(repo.format.clone());
+        if let Some(payload) = event.payload.as_object_mut() {
+            if let Some(run_id) = &ci.run_id {
+                payload.insert("run_id".to_string(), json!(run_id));
+            }
+            payload.insert("run_job_count".to_string(), json!(ci.run_job_count));
+            payload.insert("run_all_terminal".to_string(), json!(ci.run_all_terminal));
+        }
+        events.push(event);
     }
 
     events.sort_by(|left, right| {
@@ -404,20 +507,14 @@ async fn fetch_issues(
         .github_repo
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = client
-        .get(format!(
-            "{}/repos/{}/issues",
-            api_base.trim_end_matches('/'),
-            github_repo
-        ))
-        .query(&[("state", "all"), ("per_page", "100")])
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub API request failed with {status}: {body}").into());
-    }
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/issues"),
+        &[("state", "all"), ("per_page", "100")],
+        &format!("issues for {github_repo}"),
+    )
+    .await?;
     let issues: Vec<GitHubIssue> = response.json().await?;
     Ok(issues
         .into_iter()
@@ -445,20 +542,14 @@ async fn fetch_pull_requests(
         .github_repo
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
-    let response = client
-        .get(format!(
-            "{}/repos/{}/pulls",
-            api_base.trim_end_matches('/'),
-            github_repo
-        ))
-        .query(&[("state", "all"), ("per_page", "100")])
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub API request failed with {status}: {body}").into());
-    }
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/pulls"),
+        &[("state", "all"), ("per_page", "100")],
+        &format!("pull requests for {github_repo}"),
+    )
+    .await?;
     let pulls: Vec<GitHubPullRequest> = response.json().await?;
     Ok(pulls
         .into_iter()
@@ -494,11 +585,27 @@ async fn fetch_ci_statuses(
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
     let mut check_runs = HashMap::new();
+    let mut seen_run_ids = HashSet::new();
 
     for (number, pr) in open_prs {
         for check_run in fetch_check_runs(client, api_base, &github_repo, *number, pr).await? {
+            if let Some(run_id) = &check_run.run_id {
+                seen_run_ids.insert(run_id.clone());
+            }
             check_runs.insert(check_run.dedupe_key(), check_run);
         }
+    }
+
+    for workflow_run in fetch_direct_workflow_runs(client, api_base, &github_repo, snapshot).await?
+    {
+        if workflow_run
+            .run_id
+            .as_ref()
+            .is_some_and(|run_id| seen_run_ids.contains(run_id))
+        {
+            continue;
+        }
+        check_runs.insert(workflow_run.dedupe_key(), workflow_run);
     }
 
     Ok(check_runs)
@@ -511,36 +618,107 @@ async fn fetch_check_runs(
     pr_number: u64,
     pr: &PullRequestSnapshot,
 ) -> Result<Vec<GitHubCISnapshot>> {
-    let response = client
-        .get(format!(
-            "{}/repos/{}/commits/{}/check-runs",
-            api_base.trim_end_matches('/'),
-            github_repo,
-            pr.head_sha
-        ))
-        .query(&[("per_page", "100")])
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub API request failed with {status}: {body}").into());
-    }
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/commits/{}/check-runs", pr.head_sha),
+        &[("per_page", "100")],
+        &format!("check runs for {github_repo} PR #{pr_number}"),
+    )
+    .await?;
 
     let runs: GitHubCheckRunsResponse = response.json().await?;
+    let run_summaries = summarize_workflow_runs(&runs.check_runs);
     Ok(runs
         .check_runs
         .into_iter()
-        .map(|check_run| GitHubCISnapshot {
-            pr_number: Some(pr_number),
-            workflow: check_run.name,
-            status: check_run.status,
-            conclusion: check_run.conclusion,
-            sha: check_run.head_sha,
-            url: check_run.details_url.unwrap_or_else(|| pr.url.clone()),
-            branch: Some(pr.head_branch.clone()),
+        .map(|check_run| {
+            let url = check_run.details_url.unwrap_or_else(|| pr.url.clone());
+            let run_id = workflow_run_id(&url);
+            let (run_job_count, run_all_terminal) = run_id
+                .as_deref()
+                .and_then(|id| run_summaries.get(id).copied())
+                .unwrap_or((1, check_run.status == "completed"));
+            GitHubCISnapshot {
+                pr_number: Some(pr_number),
+                workflow: check_run.name,
+                status: check_run.status,
+                conclusion: check_run.conclusion,
+                sha: check_run.head_sha,
+                url,
+                branch: Some(pr.head_branch.clone()),
+                run_id,
+                run_job_count,
+                run_all_terminal,
+            }
         })
         .collect())
+}
+
+fn summarize_workflow_runs(check_runs: &[GitHubCheckRun]) -> HashMap<String, (usize, bool)> {
+    let mut summaries = HashMap::new();
+    for check_run in check_runs {
+        let Some(run_id) = check_run.details_url.as_deref().and_then(workflow_run_id) else {
+            continue;
+        };
+        let entry = summaries.entry(run_id).or_insert((0, true));
+        entry.0 += 1;
+        entry.1 &= check_run.status == "completed";
+    }
+    summaries
+}
+
+async fn fetch_direct_workflow_runs(
+    client: &reqwest::Client,
+    api_base: &str,
+    github_repo: &str,
+    snapshot: &GitSnapshot,
+) -> Result<Vec<GitHubCISnapshot>> {
+    let mut query = vec![("per_page", "100"), ("event", "push")];
+    if !snapshot.branch.is_empty() {
+        query.push(("branch", snapshot.branch.as_str()));
+    }
+
+    let response = github_get(
+        client,
+        api_base,
+        &format!("repos/{github_repo}/actions/runs"),
+        &query,
+        &format!("workflow runs for {github_repo}"),
+    )
+    .await?;
+
+    let runs: GitHubWorkflowRunsResponse = response.json().await?;
+    Ok(runs
+        .workflow_runs
+        .into_iter()
+        .filter(|run| run.pull_requests.is_empty())
+        .map(|run| {
+            let run_all_terminal = run.status == "completed";
+            GitHubCISnapshot {
+                pr_number: None,
+                workflow: run
+                    .name
+                    .unwrap_or_else(|| format!("workflow-run-{}", run.id)),
+                status: run.status,
+                conclusion: run.conclusion,
+                sha: run.head_sha,
+                url: run.html_url,
+                branch: non_empty_string(run.head_branch),
+                run_id: Some(run.id.to_string()),
+                run_job_count: 1,
+                run_all_terminal,
+            }
+        })
+        .collect())
+}
+
+fn workflow_run_id(url: &str) -> Option<String> {
+    url.split("/actions/runs/")
+        .nth(1)
+        .and_then(|tail| tail.split('/').next())
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
 }
 
 fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
@@ -608,6 +786,29 @@ struct GitHubCheckRun {
     head_sha: String,
 }
 
+#[derive(Deserialize)]
+struct GitHubWorkflowRunsResponse {
+    workflow_runs: Vec<GitHubWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct GitHubWorkflowRun {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    status: String,
+    conclusion: Option<String>,
+    head_branch: String,
+    head_sha: String,
+    html_url: String,
+    #[serde(default)]
+    pull_requests: Vec<serde_json::Value>,
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
+}
+
 fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static str {
     if status != "completed" {
         return "github.ci-started";
@@ -624,6 +825,8 @@ fn classify_ci_event_kind(status: &str, conclusion: Option<&str>) -> &'static st
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use crate::config::{DefaultsConfig, RouteRule};
@@ -632,7 +835,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn new_issue_events_match_repo_filter_and_route_mention() {
+    async fn new_issue_events_apply_route_channel_and_mention_over_repo_monitor_channel() {
         let repo = GitRepoMonitor {
             path: "/tmp/clawhip".into(),
             name: Some("clawhip".into()),
@@ -658,6 +861,7 @@ mod tests {
         let config = AppConfig {
             defaults: DefaultsConfig {
                 channel: Some("fallback".into()),
+                channel_name: None,
                 format: MessageFormat::Compact,
             },
             routes: vec![RouteRule {
@@ -667,6 +871,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 channel: Some("route-channel".into()),
+                channel_name: None,
                 webhook: None,
                 slack_webhook: None,
                 mention: Some("<@1465264645320474637>".into()),
@@ -678,7 +883,7 @@ mod tests {
         };
         let router = Router::new(Arc::new(config));
         let (channel, _, content) = router.preview(&events[0]).await.unwrap();
-        assert_eq!(channel, "dev-channel");
+        assert_eq!(channel, "route-channel");
         assert!(content.starts_with("<@1465264645320474637> "));
         assert!(content.contains("live issue"));
     }
@@ -737,7 +942,197 @@ mod tests {
             sha: "abcdef1234567890".into(),
             url: "https://github.com/Yeachan-Heo/clawhip/actions/runs/1".into(),
             branch: Some("feat/github-ci-events".into()),
+            run_id: Some("1".into()),
+            run_job_count: 1,
+            run_all_terminal: status == "completed",
         }
+    }
+
+    #[tokio::test]
+    async fn direct_branch_workflow_run_without_open_pr_emits_ci_failed_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = json!({
+                "workflow_runs": [{
+                    "id": 24007460067_u64,
+                    "name": "Rust CI",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "head_branch": "main",
+                    "head_sha": "deadbeef",
+                    "html_url": "https://github.com/ultraworkers/claw-code/actions/runs/24007460067",
+                    "pull_requests": []
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            req
+        });
+
+        let mut config = AppConfig::default();
+        config.monitors.github_api_base = format!("http://{addr}");
+        let repo = GitRepoMonitor {
+            path: "/tmp/claw-code".into(),
+            emit_pr_status: true,
+            ..GitRepoMonitor::default()
+        };
+        let snapshot = GitSnapshot {
+            repo_name: "claw-code".into(),
+            repo_path: "/tmp/claw-code".into(),
+            worktree_path: "/tmp/claw-code".into(),
+            branch: "main".into(),
+            head: "deadbeef".into(),
+            commits: Vec::new(),
+            github_repo: Some("ultraworkers/claw-code".into()),
+        };
+        let client = build_github_client(None).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let prs = HashMap::new();
+
+        let ci = poll_ci_statuses(&config, Some(&client), &repo, &snapshot, None, &prs, &tx)
+            .await
+            .unwrap();
+
+        assert_eq!(ci.len(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "first poll after startup should prime CI baseline without emitting historical events"
+        );
+
+        let req = server.await.unwrap();
+        assert!(req.contains("GET /repos/ultraworkers/claw-code/actions/runs?"));
+        assert!(req.contains("branch=main"));
+        assert!(req.contains("event=push"));
+        assert!(req.contains("per_page=100"));
+    }
+
+    #[tokio::test]
+    async fn direct_workflow_runs_skip_run_ids_already_seen_from_pr_checks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let responses = [
+                json!({
+                    "check_runs": [{
+                        "name": "test",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "details_url": "https://github.com/org/repo/actions/runs/123/jobs/1",
+                        "head_sha": "prsha"
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "workflow_runs": [
+                        {
+                            "id": 123_u64,
+                            "name": "CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "feat/pr",
+                            "head_sha": "prsha",
+                            "html_url": "https://github.com/org/repo/actions/runs/123",
+                            "pull_requests": [{"number": 42}]
+                        },
+                        {
+                            "id": 456_u64,
+                            "name": "Rust CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "main",
+                            "head_sha": "mainsha",
+                            "html_url": "https://github.com/org/repo/actions/runs/456",
+                            "pull_requests": []
+                        }
+                    ]
+                })
+                .to_string(),
+            ];
+
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                // connection: close prevents reqwest from reusing the TCP
+                // stream — the mock server calls accept() per request, so
+                // keep-alive pooling causes the 2nd request to go to a dead
+                // connection under load (flake root-cause, see #194).
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            requests
+        });
+
+        let snapshot = GitSnapshot {
+            repo_name: "repo".into(),
+            repo_path: "/tmp/repo".into(),
+            worktree_path: "/tmp/repo".into(),
+            branch: "main".into(),
+            head: "mainsha".into(),
+            commits: Vec::new(),
+            github_repo: Some("org/repo".into()),
+        };
+        let client = build_github_client(None).unwrap();
+        let pr = PullRequestSnapshot {
+            title: "PR".into(),
+            status: "open".into(),
+            url: "https://github.com/org/repo/pull/42".into(),
+            head_branch: "feat/pr".into(),
+            head_sha: "prsha".into(),
+        };
+        let open_prs = vec![(42_u64, &pr)];
+
+        let ci = fetch_ci_statuses(
+            &client,
+            &format!("http://{addr}"),
+            &GitRepoMonitor::default(),
+            &snapshot,
+            &open_prs,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ci.len(), 2);
+        assert_eq!(
+            ci.values()
+                .filter(|snapshot| snapshot.run_id.as_deref() == Some("123"))
+                .count(),
+            1
+        );
+        let direct = ci
+            .values()
+            .find(|snapshot| snapshot.run_id.as_deref() == Some("456"))
+            .unwrap();
+        assert_eq!(direct.pr_number, None);
+        assert_eq!(direct.branch.as_deref(), Some("main"));
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("GET /repos/org/repo/commits/prsha/check-runs?"));
+        assert!(requests[1].contains("GET /repos/org/repo/actions/runs?"));
+        assert!(requests[1].contains("branch=main"));
+        assert!(requests[1].contains("event=push"));
     }
 
     #[test]
@@ -879,5 +1274,89 @@ mod tests {
             req.contains("Authorization: Bearer secret-token")
                 || req.contains("authorization: Bearer secret-token")
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_falls_back_to_configured_github_repo_without_local_clone() {
+        let repo = GitRepoMonitor {
+            path: "/tmp/clawhip-test-private-repo-missing".into(),
+            name: Some("private-repo".into()),
+            github_repo: Some("owner/private-repo".into()),
+            ..GitRepoMonitor::default()
+        };
+
+        let snapshot = snapshot_github_repo(&repo).await.unwrap();
+
+        assert_eq!(snapshot.repo_name, "private-repo");
+        assert_eq!(snapshot.github_repo.as_deref(), Some("owner/private-repo"));
+    }
+
+    #[tokio::test]
+    async fn source_loop_survives_transient_github_api_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = request_count.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let responses = [
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 4\r\n\r\nboom",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n[]",
+            ];
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                request_count_for_server.fetch_add(1, Ordering::SeqCst);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            requests
+        });
+
+        let mut config = AppConfig::default();
+        config.monitors.poll_interval_secs = 1;
+        config.monitors.github_api_base = format!("http://{addr}");
+        config.monitors.git.repos = vec![GitRepoMonitor {
+            path: "/tmp/clawhip-test-private-repo-missing".into(),
+            name: Some("private-repo".into()),
+            github_repo: Some("owner/private-repo".into()),
+            emit_commits: false,
+            emit_branch_changes: false,
+            emit_issue_opened: true,
+            emit_pr_status: false,
+            ..GitRepoMonitor::default()
+        }];
+
+        let source = GitHubSource::new(Arc::new(config));
+        let (tx, _rx) = mpsc::channel(4);
+        let source_task = tokio::spawn(async move { source.run(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while request_count.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !source_task.is_finished(),
+            "GitHub source loop exited after a transient API failure"
+        );
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.contains("GET /repos/owner/private-repo/issues?")
+                || request.contains("GET /repos/owner/private-repo/issues ")
+        }));
+
+        source_task.abort();
+        let _ = source_task.await;
     }
 }

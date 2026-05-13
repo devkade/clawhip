@@ -3,8 +3,8 @@ pub mod compat;
 
 pub use body::{
     AgentEvent, CustomEvent, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent,
-    GitHubCIEvent, GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent,
-    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent,
+    GitHubCIEvent, GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
+    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 
 use time::OffsetDateTime;
@@ -33,6 +33,9 @@ pub enum EventBody {
     GitHubPRMerged(GitHubPREvent),
     GitHubPRStatusChanged(GitHubPRStatusEvent),
     GitHubCIFailed(GitHubCIEvent),
+    GitHubReleasePublished(GitHubReleaseEvent),
+    GitHubReleasePrereleased(GitHubReleaseEvent),
+    GitHubReleaseEdited(GitHubReleaseEvent),
     TmuxKeyword(TmuxKeywordEvent),
     TmuxKeywordAggregated(TmuxKeywordAggregatedEvent),
     TmuxStale(TmuxStaleEvent),
@@ -40,6 +43,21 @@ pub enum EventBody {
     AgentBlocked(AgentEvent),
     AgentFinished(AgentEvent),
     AgentFailed(AgentEvent),
+    AgentRetryNeeded(AgentEvent),
+    AgentPRCreated(AgentEvent),
+    AgentTestStarted(AgentEvent),
+    AgentTestFinished(AgentEvent),
+    AgentTestFailed(AgentEvent),
+    AgentHandoffNeeded(AgentEvent),
+    AgentPromptSubmitted(AgentEvent),
+    AgentPromptDelivered(AgentEvent),
+    AgentPromptDeliveryFailed(AgentEvent),
+    AgentStopped(AgentEvent),
+    WorkspaceSessionStarted(WorkspaceEvent),
+    WorkspaceTurnComplete(WorkspaceEvent),
+    WorkspaceSkillActivated(WorkspaceEvent),
+    WorkspaceSessionBlocked(WorkspaceEvent),
+    WorkspaceMetricsUpdate(WorkspaceEvent),
     Custom(CustomEvent),
 }
 

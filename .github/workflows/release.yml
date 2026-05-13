@@ -45,8 +45,26 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Fail fast if tag/Cargo.toml/Cargo.lock/CHANGELOG are out of sync.
+  preflight:
+    runs-on: "ubuntu-22.04"
+    if: ${{ !github.event.pull_request }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build clawhip (release preflight needs the binary)
+        run: cargo build --release
+      - name: Release consistency preflight
+        run: ./target/release/clawhip release preflight "${{ github.ref_name }}"
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - preflight
+    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -113,9 +131,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
-      - name: enable windows longpaths
-        run: |
-          git config --global core.longpaths true
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -146,9 +161,6 @@ jobs:
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
-        # We force bash here just because github makes it really hard to get values up
-        # to "real" actions without writing to env-vars, and writing to env-vars has
-        # inconsistent syntax between shell and powershell.
         shell: bash
         run: |
           # Parse out what we just built and upload it to scratch storage
@@ -294,8 +306,10 @@ jobs:
           submodules: recursive
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Verify crates publish payload
+        run: cargo publish --dry-run --locked --package clawhip --manifest-path Cargo.toml
       - name: Publish to crates.io
-        run: cargo publish --no-verify --allow-dirty
+        run: cargo publish --locked --package clawhip --manifest-path Cargo.toml
 
   announce:
     needs:

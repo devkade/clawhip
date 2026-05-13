@@ -6,8 +6,8 @@ use crate::Result;
 use crate::event::{
     AgentEvent, CustomEvent, EventBody, EventEnvelope, EventMetadata, EventPriority,
     GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent, GitHubCIEvent,
-    GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, TmuxKeywordAggregatedEvent,
-    TmuxKeywordEvent, TmuxStaleEvent,
+    GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent, GitHubReleaseEvent,
+    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 use crate::events::{IncomingEvent, normalize_event};
 
@@ -24,7 +24,7 @@ impl TryFrom<&IncomingEvent> for EventEnvelope {
         let payload = &normalized.payload;
 
         Ok(Self {
-            id: Uuid::new_v4(),
+            id: event_id_for(&normalized).unwrap_or_else(Uuid::new_v4),
             timestamp: OffsetDateTime::now_utc(),
             source: source_for_kind(kind),
             body: body_for(kind, payload)?,
@@ -56,6 +56,15 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         )?)),
         "github.issue-closed" => Ok(EventBody::GitHubIssueClosed(github_issue_event(payload)?)),
         "github.pr-status-changed" => github_pr_body(payload),
+        "github.release-published" => Ok(EventBody::GitHubReleasePublished(github_release_event(
+            payload,
+        )?)),
+        "github.release-prereleased" => Ok(EventBody::GitHubReleasePrereleased(
+            github_release_event(payload)?,
+        )),
+        "github.release-edited" => Ok(EventBody::GitHubReleaseEdited(github_release_event(
+            payload,
+        )?)),
         "github.ci-failed" => Ok(EventBody::GitHubCIFailed(GitHubCIEvent {
             repo: string_field(payload, "repo")?,
             number: payload.get("number").and_then(Value::as_u64),
@@ -80,6 +89,39 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
             Ok(EventBody::AgentFinished(agent_event(payload)?))
         }
         "agent.failed" | "session.failed" => Ok(EventBody::AgentFailed(agent_event(payload)?)),
+        "session.retry-needed" => Ok(EventBody::AgentRetryNeeded(agent_event(payload)?)),
+        "session.pr-created" => Ok(EventBody::AgentPRCreated(agent_event(payload)?)),
+        "session.test-started" => Ok(EventBody::AgentTestStarted(agent_event(payload)?)),
+        "session.test-finished" => Ok(EventBody::AgentTestFinished(agent_event(payload)?)),
+        "session.test-failed" => Ok(EventBody::AgentTestFailed(agent_event(payload)?)),
+        "session.handoff-needed" => Ok(EventBody::AgentHandoffNeeded(agent_event(payload)?)),
+        "session.prompt-submitted" => Ok(EventBody::AgentPromptSubmitted(agent_event(payload)?)),
+        "session.prompt-delivered" => Ok(EventBody::AgentPromptDelivered(agent_event(payload)?)),
+        "session.prompt-delivery-failed" => {
+            Ok(EventBody::AgentPromptDeliveryFailed(agent_event(payload)?))
+        }
+        "session.stopped" => Ok(EventBody::AgentStopped(agent_event(payload)?)),
+        "workspace.session.started" | "workspace.session.ended" => Ok(
+            EventBody::WorkspaceSessionStarted(workspace_event(payload)?),
+        ),
+        "workspace.turn.complete" | "workspace.agent.turn" | "workspace.mission.updated" => {
+            Ok(EventBody::WorkspaceTurnComplete(workspace_event(payload)?))
+        }
+        "workspace.skill.activated"
+        | "workspace.skill.deactivated"
+        | "workspace.skill.phase-changed" => Ok(EventBody::WorkspaceSkillActivated(
+            workspace_event(payload)?,
+        )),
+        "workspace.session.blocked"
+        | "workspace.session.checkpointed"
+        | "workspace.team.nudged"
+        | "workspace.team.updated"
+        | "workspace.tmux.injection" => Ok(EventBody::WorkspaceSessionBlocked(workspace_event(
+            payload,
+        )?)),
+        "workspace.metrics.updated" => {
+            Ok(EventBody::WorkspaceMetricsUpdate(workspace_event(payload)?))
+        }
         _ => Ok(EventBody::Custom(CustomEvent {
             kind: kind.to_string(),
             message: optional_string_field(payload, "message").unwrap_or_else(|| kind.to_string()),
@@ -150,6 +192,21 @@ fn github_issue_event(payload: &Value) -> Result<GitHubIssueEvent> {
         number: u64_field(payload, "number")?,
         title: string_field(payload, "title")?,
         comments: payload.get("comments").and_then(Value::as_u64),
+    })
+}
+
+fn github_release_event(payload: &Value) -> Result<GitHubReleaseEvent> {
+    Ok(GitHubReleaseEvent {
+        repo: string_field(payload, "repo")?,
+        tag: string_field(payload, "tag")?,
+        name: optional_string_field(payload, "name").unwrap_or_default(),
+        action: optional_string_field(payload, "action").unwrap_or_else(|| "published".to_string()),
+        is_prerelease: payload
+            .get("is_prerelease")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        url: optional_string_field(payload, "url").unwrap_or_default(),
+        actor: optional_string_field(payload, "actor"),
     })
 }
 
@@ -228,26 +285,114 @@ fn tmux_keyword_body(payload: &Value) -> Result<EventBody> {
 fn agent_event(payload: &Value) -> Result<AgentEvent> {
     Ok(AgentEvent {
         agent_name: string_field(payload, "agent_name")?,
+        session_name: optional_string_field(payload, "session_name"),
         status: string_field(payload, "status")?,
+        normalized_event: optional_string_field(payload, "normalized_event").or_else(|| {
+            payload
+                .pointer("/context/normalized_event")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }),
         session_id: optional_string_field(payload, "session_id"),
         project: optional_string_field(payload, "project"),
+        repo_path: optional_string_field(payload, "repo_path"),
+        branch: optional_string_field(payload, "branch"),
+        issue_number: payload.get("issue_number").and_then(Value::as_u64),
+        pr_number: payload.get("pr_number").and_then(Value::as_u64),
+        pr_url: optional_string_field(payload, "pr_url"),
+        command: optional_string_field(payload, "command"),
+        tool_name: optional_string_field(payload, "tool_name"),
+        tmux_session: optional_string_field(payload, "tmux_session"),
+        tmux_window: optional_string_field(payload, "tmux_window"),
+        tmux_pane: optional_string_field(payload, "tmux_pane"),
+        tmux_pane_tty: optional_string_field(payload, "tmux_pane_tty"),
+        tmux_attached: payload.get("tmux_attached").and_then(Value::as_bool),
+        tmux_client_count: payload.get("tmux_client_count").and_then(Value::as_u64),
         elapsed_secs: payload.get("elapsed_secs").and_then(Value::as_u64),
         summary: optional_string_field(payload, "summary"),
-        error_message: optional_string_field(payload, "error_message"),
-        mention: optional_string_field(payload, "mention"),
+        error_summary: optional_string_field(payload, "error_summary")
+            .or_else(|| optional_string_field(payload, "error_message")),
+        error_message: optional_string_field(payload, "error_message")
+            .or_else(|| optional_string_field(payload, "error_summary")),
+        mention: optional_string_field(payload, "mention").or_else(|| {
+            payload
+                .pointer("/context/mention")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        }),
+    })
+}
+
+fn workspace_event(payload: &Value) -> Result<WorkspaceEvent> {
+    let source_tool = optional_string_field(payload, "tool")
+        .or_else(|| optional_string_field(payload, "state_family"))
+        .unwrap_or_else(|| "workspace".to_string());
+    let workspace_path = optional_string_field(payload, "workspace_root")
+        .or_else(|| optional_string_field(payload, "monitor_path"))
+        .or_else(|| optional_string_field(payload, "workspace_name"))
+        .ok_or_else(|| "missing workspace path".to_string())?;
+    let state_file = optional_string_field(payload, "state_file")
+        .or_else(|| optional_string_field(payload, "contract_event"))
+        .unwrap_or_else(|| "workspace-state".to_string());
+    let session_name = optional_string_field(payload, "session_name")
+        .or_else(|| optional_string_field(payload, "session_id"));
+    let diff_fields = payload
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .filter(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "tool"
+                            | "workspace_root"
+                            | "workspace_name"
+                            | "monitor_path"
+                            | "state_family"
+                            | "state_dir"
+                            | "state_file"
+                            | "summary"
+                            | "contract_event"
+                            | "event_id"
+                            | "correlation_id"
+                            | "first_seen_at"
+                            | "source"
+                            | "route_key"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(WorkspaceEvent {
+        source_tool,
+        workspace_path,
+        state_file,
+        session_name,
+        diff_fields,
+        summary: optional_string_field(payload, "summary"),
     })
 }
 
 fn priority_for(kind: &str, payload: &Value) -> EventPriority {
     match kind {
-        "agent.failed" | "session.failed" | "session.test-failed" | "github.ci-failed" => {
-            EventPriority::Critical
-        }
+        "agent.failed"
+        | "session.failed"
+        | "session.test-failed"
+        | "session.prompt-delivery-failed"
+        | "github.ci-failed" => EventPriority::Critical,
         "agent.blocked"
         | "session.blocked"
         | "session.retry-needed"
         | "session.handoff-needed"
-        | "tmux.stale" => EventPriority::High,
+        | "session.stopped"
+        | "tmux.stale"
+        | "workspace.session.blocked" => EventPriority::High,
+        "github.release-published" | "github.release-prereleased" => EventPriority::High,
         "github.pr-status-changed"
             if optional_string_field(payload, "new_status")
                 .map(|status| status == "merged" || status == "closed")
@@ -281,6 +426,14 @@ fn optional_string_field(payload: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn event_id_for(event: &IncomingEvent) -> Option<Uuid> {
+    event
+        .payload
+        .get("event_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
 }
 
 fn u64_field(payload: &Value, key: &str) -> Result<u64> {
@@ -430,5 +583,268 @@ mod tests {
             }
             other => panic!("expected GitHubCIFailed body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn maps_all_canonical_session_events_to_typed_agent_variants() {
+        let cases = [
+            (
+                "session.started",
+                EventBody::AgentStarted(sample_agent_event("started")),
+            ),
+            (
+                "session.blocked",
+                EventBody::AgentBlocked(sample_agent_event("blocked")),
+            ),
+            (
+                "session.finished",
+                EventBody::AgentFinished(sample_agent_event("finished")),
+            ),
+            (
+                "session.failed",
+                EventBody::AgentFailed(sample_agent_event("failed")),
+            ),
+            (
+                "session.retry-needed",
+                EventBody::AgentRetryNeeded(sample_agent_event("retry-needed")),
+            ),
+            (
+                "session.pr-created",
+                EventBody::AgentPRCreated(sample_agent_event("pr-created")),
+            ),
+            (
+                "session.test-started",
+                EventBody::AgentTestStarted(sample_agent_event("test-started")),
+            ),
+            (
+                "session.test-finished",
+                EventBody::AgentTestFinished(sample_agent_event("test-finished")),
+            ),
+            (
+                "session.test-failed",
+                EventBody::AgentTestFailed(sample_agent_event("test-failed")),
+            ),
+            (
+                "session.handoff-needed",
+                EventBody::AgentHandoffNeeded(sample_agent_event("handoff-needed")),
+            ),
+            (
+                "session.prompt-submitted",
+                EventBody::AgentPromptSubmitted(sample_agent_event("prompt-submitted")),
+            ),
+            (
+                "session.prompt-delivered",
+                EventBody::AgentPromptDelivered(sample_agent_event("prompt-delivered")),
+            ),
+            (
+                "session.prompt-delivery-failed",
+                EventBody::AgentPromptDeliveryFailed(sample_agent_event("prompt-delivery-failed")),
+            ),
+            (
+                "session.stopped",
+                EventBody::AgentStopped(sample_agent_event("stopped")),
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let event = IncomingEvent {
+                kind: kind.into(),
+                channel: None,
+                mention: None,
+                format: None,
+                template: None,
+                payload: sample_agent_payload(expected_normalized_event(&expected)),
+            };
+
+            let envelope = from_incoming_event(&event).unwrap();
+            assert_eq!(envelope.body, expected, "unexpected body for {kind}");
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_agent_variants_backward_compatible() {
+        let event = IncomingEvent {
+            kind: "agent.finished".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: sample_agent_payload("finished"),
+        };
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert!(matches!(envelope.body, EventBody::AgentFinished(_)));
+    }
+
+    #[test]
+    fn reuses_normalized_event_id_when_available() {
+        let event = crate::events::normalize_event(IncomingEvent::custom(None, "hello".into()));
+        let envelope = from_incoming_event(&event).unwrap();
+
+        assert_eq!(
+            envelope.id.to_string(),
+            event.payload["event_id"].as_str().unwrap()
+        );
+    }
+
+    fn sample_agent_payload(normalized_event: &str) -> Value {
+        json!({
+            "agent_name": "omx",
+            "session_name": "issue-65",
+            "status": normalized_event,
+            "normalized_event": normalized_event,
+            "session_id": "sess-65",
+            "project": "clawhip",
+            "repo_path": "/repo/clawhip",
+            "branch": "feat/issue-65",
+            "issue_number": 65,
+            "pr_number": 72,
+            "pr_url": "https://github.com/Yeachan-Heo/clawhip/pull/72",
+            "command": "cargo test",
+            "tool_name": "Bash",
+            "tmux_session": "issue-65",
+            "tmux_window": "1",
+            "tmux_pane": "%42",
+            "tmux_pane_tty": "/dev/pts/9",
+            "tmux_attached": true,
+            "tmux_client_count": 2,
+            "elapsed_secs": 42,
+            "summary": "summary",
+            "error_summary": "error summary",
+            "mention": "@ops"
+        })
+    }
+
+    fn sample_agent_event(normalized_event: &str) -> AgentEvent {
+        AgentEvent {
+            agent_name: "omx".into(),
+            session_name: Some("issue-65".into()),
+            status: normalized_event.into(),
+            normalized_event: Some(normalized_event.into()),
+            session_id: Some("sess-65".into()),
+            project: Some("clawhip".into()),
+            repo_path: Some("/repo/clawhip".into()),
+            branch: Some("feat/issue-65".into()),
+            issue_number: Some(65),
+            pr_number: Some(72),
+            pr_url: Some("https://github.com/Yeachan-Heo/clawhip/pull/72".into()),
+            command: Some("cargo test".into()),
+            tool_name: Some("Bash".into()),
+            tmux_session: Some("issue-65".into()),
+            tmux_window: Some("1".into()),
+            tmux_pane: Some("%42".into()),
+            tmux_pane_tty: Some("/dev/pts/9".into()),
+            tmux_attached: Some(true),
+            tmux_client_count: Some(2),
+            elapsed_secs: Some(42),
+            summary: Some("summary".into()),
+            error_summary: Some("error summary".into()),
+            error_message: Some("error summary".into()),
+            mention: Some("@ops".into()),
+        }
+    }
+
+    fn expected_normalized_event(body: &EventBody) -> &'static str {
+        match body {
+            EventBody::AgentStarted(_) => "started",
+            EventBody::AgentBlocked(_) => "blocked",
+            EventBody::AgentFinished(_) => "finished",
+            EventBody::AgentFailed(_) => "failed",
+            EventBody::AgentRetryNeeded(_) => "retry-needed",
+            EventBody::AgentPRCreated(_) => "pr-created",
+            EventBody::AgentTestStarted(_) => "test-started",
+            EventBody::AgentTestFinished(_) => "test-finished",
+            EventBody::AgentTestFailed(_) => "test-failed",
+            EventBody::AgentHandoffNeeded(_) => "handoff-needed",
+            EventBody::AgentPromptSubmitted(_) => "prompt-submitted",
+            EventBody::AgentPromptDelivered(_) => "prompt-delivered",
+            EventBody::AgentPromptDeliveryFailed(_) => "prompt-delivery-failed",
+            EventBody::AgentStopped(_) => "stopped",
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn workspace_blocked_events_are_high_priority() {
+        let event = IncomingEvent::workspace(
+            "workspace.session.blocked".into(),
+            json!({"workspace_name": "repo", "workspace_root": "/tmp/repo", "state_file": "notify-fallback-state.json", "summary": "waiting"}),
+            None,
+        );
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert_eq!(envelope.metadata.priority, EventPriority::High);
+    }
+
+    #[test]
+    fn maps_github_release_published_event() {
+        let event = IncomingEvent::github_release(
+            "published",
+            "Yeachan-Heo/clawhip".into(),
+            "v0.6.0".into(),
+            "clawhip 0.6.0".into(),
+            false,
+            "https://github.com/Yeachan-Heo/clawhip/releases/tag/v0.6.0".into(),
+            Some("Yeachan-Heo".into()),
+            Some("releases".into()),
+        );
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert_eq!(envelope.source, "github");
+        assert_eq!(envelope.metadata.channel_hint.as_deref(), Some("releases"));
+        assert_eq!(envelope.metadata.priority, EventPriority::High);
+        match envelope.body {
+            EventBody::GitHubReleasePublished(body) => {
+                assert_eq!(body.repo, "Yeachan-Heo/clawhip");
+                assert_eq!(body.tag, "v0.6.0");
+                assert_eq!(body.name, "clawhip 0.6.0");
+                assert!(!body.is_prerelease);
+                assert_eq!(body.actor.as_deref(), Some("Yeachan-Heo"));
+            }
+            other => panic!("expected GitHubReleasePublished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_github_release_prereleased_event() {
+        let event = IncomingEvent::github_release(
+            "prereleased",
+            "Yeachan-Heo/clawhip".into(),
+            "v0.6.0-rc.1".into(),
+            "clawhip 0.6.0-rc.1".into(),
+            true,
+            "https://github.com/Yeachan-Heo/clawhip/releases/tag/v0.6.0-rc.1".into(),
+            None,
+            None,
+        );
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert_eq!(envelope.metadata.priority, EventPriority::High);
+        match envelope.body {
+            EventBody::GitHubReleasePrereleased(body) => {
+                assert!(body.is_prerelease);
+                assert_eq!(body.tag, "v0.6.0-rc.1");
+                assert!(body.actor.is_none());
+            }
+            other => panic!("expected GitHubReleasePrereleased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_github_release_edited_event() {
+        let event = IncomingEvent::github_release(
+            "edited",
+            "Yeachan-Heo/clawhip".into(),
+            "v0.5.4".into(),
+            "clawhip 0.5.4".into(),
+            false,
+            "https://github.com/Yeachan-Heo/clawhip/releases/tag/v0.5.4".into(),
+            Some("Yeachan-Heo".into()),
+            None,
+        );
+
+        let envelope = from_incoming_event(&event).unwrap();
+        assert_eq!(envelope.metadata.priority, EventPriority::Normal);
+        assert!(matches!(envelope.body, EventBody::GitHubReleaseEdited(_)));
     }
 }
