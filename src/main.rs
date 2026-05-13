@@ -7,6 +7,7 @@ mod dispatch;
 mod dynamic_tokens;
 mod event;
 mod events;
+mod kapi_alert;
 mod keyword_window;
 mod lifecycle;
 mod memory;

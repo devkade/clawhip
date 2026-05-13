@@ -567,7 +567,42 @@ Verification:
 - emit keyword in pane
 - confirm Discord message body and mention
 
-### 12. install lifecycle preset
+### 12. Kapi worker alert preset
+
+Input:
+```json
+{
+  "kind": "kapi.worker.review-ready",
+  "payload": {
+    "repo": "devkade/kapi",
+    "slug": "issue-78-registry-hardening",
+    "branch": "feat/issue-78-registry-hardening",
+    "mode": "ralph",
+    "reason": "candidate-ready",
+    "summary": "worker reports candidate implementation + verification",
+    "recommended": "kapi report issue-78-registry-hardening --from /repo --json"
+  }
+}
+```
+
+Behavior:
+- render `kapi.worker.*` events as compact, scannable `[kapi]` summaries instead of raw JSON
+- dedupe repeated identical worker alerts in the daemon dispatcher
+- allow repeated `kapi.worker.stale` notifications only after `[kapi_alerts].stale_repeat_secs` (default 900s)
+- prepend route/event mentions only for action-worthy worker states (`blocked`, `failed`, `stale`, `review-ready`, `candidate-ready`, `merge-ready`)
+
+Configuration:
+```toml
+[kapi_alerts]
+stale_repeat_secs = 900
+```
+
+Verification:
+- POST duplicate `kapi.worker.running` events and confirm only the first is delivered
+- POST `kapi.worker.blocked` or `kapi.worker.review-ready` with a route mention and confirm the mention is kept
+- POST `kapi.worker.running` with a route mention and confirm the message is not a ping
+
+### 13. install lifecycle preset
 
 Input:
 ```bash

@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::events::{IncomingEvent, MessageFormat};
+use crate::kapi_alert;
 
 use super::Renderer;
 
@@ -13,6 +14,20 @@ impl Renderer for DefaultRenderer {
         let payload = &event.payload;
         if event.canonical_kind() == "pi.state-summary" {
             return render_pi_state_summary(payload, format);
+        }
+        if kapi_alert::is_kapi_worker_event(event.canonical_kind()) {
+            return Ok(match format {
+                MessageFormat::Compact => {
+                    kapi_alert::render_worker_event(event.canonical_kind(), payload, false, false)
+                }
+                MessageFormat::Alert => {
+                    kapi_alert::render_worker_event(event.canonical_kind(), payload, true, false)
+                }
+                MessageFormat::Inline => {
+                    kapi_alert::render_worker_event(event.canonical_kind(), payload, false, true)
+                }
+                MessageFormat::Raw => serde_json::to_string_pretty(payload)?,
+            });
         }
         if event.canonical_kind().starts_with("session.") {
             return render_session_event(event.canonical_kind(), payload, format);
@@ -687,5 +702,60 @@ mod tests {
         assert!(rendered.contains("running=2"));
         assert!(rendered.contains("blocked=1"));
         assert!(rendered.contains("tool-active=1"));
+    }
+
+    #[test]
+    fn renders_kapi_worker_review_ready_as_compact_action_alert() {
+        let event = IncomingEvent {
+            kind: "kapi.worker.review-ready".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": "devkade/kapi",
+                "slug": "issue-78-registry-hardening",
+                "branch": "feat/issue-78-registry-hardening",
+                "mode": "ralph",
+                "reason": "candidate-ready",
+                "summary": "worker reports candidate implementation + verification",
+                "recommended": "kapi report issue-78-registry-hardening --from /repo --json"
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Compact)
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            "[kapi] review-ready\nrepo: devkade/kapi\nslug: issue-78-registry-hardening\nbranch: feat/issue-78-registry-hardening\nmode: ralph\nreason: candidate-ready\nsummary: worker reports candidate implementation + verification\nrecommended: kapi report issue-78-registry-hardening --from /repo --json"
+        );
+    }
+
+    #[test]
+    fn renders_kapi_worker_running_without_action_prefix() {
+        let event = IncomingEvent {
+            kind: "kapi.worker.running".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": "devkade/kapi",
+                "slug": "issue-78-registry-hardening",
+                "mode": "ralph",
+                "summary": "worker still running"
+            }),
+        };
+
+        let rendered = DefaultRenderer
+            .render(&event, &MessageFormat::Inline)
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            "[kapi:running] devkade/kapi issue-78-registry-hardening (ralph) — worker still running"
+        );
     }
 }

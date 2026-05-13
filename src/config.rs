@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::events::MessageFormat;
+use crate::kapi_alert::KapiAlertConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -23,6 +24,8 @@ pub struct AppConfig {
     pub routes: Vec<RouteRule>,
     #[serde(default)]
     pub monitors: MonitorConfig,
+    #[serde(default)]
+    pub kapi_alerts: KapiAlertConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

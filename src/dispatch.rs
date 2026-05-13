@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::Result;
 use crate::events::IncomingEvent;
+use crate::kapi_alert::KapiAlertDedupe;
 use crate::render::Renderer;
 use crate::router::Router;
 use crate::sink::{Sink, SinkMessage};
@@ -13,6 +14,8 @@ pub struct Dispatcher {
     router: Router,
     renderer: Box<dyn Renderer>,
     sinks: HashMap<String, Box<dyn Sink>>,
+    kapi_dedupe: KapiAlertDedupe,
+    kapi_stale_repeat_secs: u64,
 }
 
 impl Dispatcher {
@@ -22,16 +25,26 @@ impl Dispatcher {
         renderer: Box<dyn Renderer>,
         sinks: HashMap<String, Box<dyn Sink>>,
     ) -> Self {
+        let kapi_stale_repeat_secs = router.kapi_stale_repeat_secs();
         Self {
             rx,
             router,
             renderer,
             sinks,
+            kapi_dedupe: KapiAlertDedupe::default(),
+            kapi_stale_repeat_secs,
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         while let Some(event) = self.rx.recv().await {
+            if !self
+                .kapi_dedupe
+                .should_emit_now(&event, self.kapi_stale_repeat_secs)
+            {
+                continue;
+            }
+
             let deliveries = match self.router.resolve(&event).await {
                 Ok(deliveries) => deliveries,
                 Err(error) => {

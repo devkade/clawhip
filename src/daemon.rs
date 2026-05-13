@@ -678,6 +678,12 @@ mod tests {
             payload["summary"]["tool_hint_counts"]["cargo test"],
             Value::from(1)
         );
-        assert_eq!(payload["summary"]["tool_error_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["summary"]["tool_error_sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

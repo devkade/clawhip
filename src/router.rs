@@ -4,6 +4,7 @@ use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
 use crate::dynamic_tokens;
 use crate::events::{IncomingEvent, MessageFormat};
+use crate::kapi_alert;
 #[cfg(test)]
 use crate::render::DefaultRenderer;
 use crate::render::Renderer;
@@ -30,6 +31,10 @@ pub struct Router {
 impl Router {
     pub fn new(config: Arc<AppConfig>) -> Self {
         Self { config }
+    }
+
+    pub fn kapi_stale_repeat_secs(&self) -> u64 {
+        self.config.kapi_alerts.stale_repeat_secs
     }
 
     #[cfg(test)]
@@ -135,8 +140,11 @@ impl Router {
             }
         };
 
-        match delivery.mention.as_deref().map(str::trim) {
-            Some(mention) if !mention.is_empty() => Ok(format!("{mention} {content}")),
+        match (
+            delivery.mention.as_deref().map(str::trim),
+            kapi_alert::should_apply_mention(event),
+        ) {
+            (Some(mention), true) if !mention.is_empty() => Ok(format!("{mention} {content}")),
             _ => Ok(content),
         }
     }
@@ -599,6 +607,63 @@ mod tests {
         let (_, _, tmux_content) = router.preview(&tmux_event).await.unwrap();
         assert!(tmux_content.starts_with("<@botid> "));
         assert!(tmux_content.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn route_level_mention_only_applies_to_actionable_kapi_worker_events() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "kapi.worker.*".into(),
+                sink: "discord".into(),
+                filter: Default::default(),
+                channel: Some("kapi-route".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: Some("<@botid>".into()),
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+
+        let running_event = IncomingEvent {
+            kind: "kapi.worker.running".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": "devkade/kapi",
+                "slug": "issue-78",
+                "mode": "ralph",
+                "summary": "worker still running"
+            }),
+        };
+        let (_, _, running_content) = router.preview(&running_event).await.unwrap();
+        assert!(!running_content.starts_with("<@botid> "));
+
+        let blocked_event = IncomingEvent {
+            kind: "kapi.worker.blocked".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo": "devkade/kapi",
+                "slug": "issue-78",
+                "mode": "ralph",
+                "reason": "blocked",
+                "summary": "needs review"
+            }),
+        };
+        let (_, _, blocked_content) = router.preview(&blocked_event).await.unwrap();
+        assert!(blocked_content.starts_with("<@botid> "));
     }
 
     #[tokio::test]
