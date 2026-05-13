@@ -1,0 +1,187 @@
+name: kapi-agent review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: kapi-agent-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: kapi-agent review
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install Node.js for kapi-review
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Checkout Kapi reviewer
+        uses: actions/checkout@v4
+        with:
+          repository: devkade/kapi
+          ref: dev
+          path: .kapi-reviewer
+
+      - name: Install Kapi reviewer dependencies
+        working-directory: .kapi-reviewer
+        run: npm ci
+
+      - name: Run verification and prepare kapi-agent review
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ARTIFACT_ROOT: ${{ runner.temp }}/kapi-agent-artifacts
+        run: |
+          set -uo pipefail
+
+          mkdir -p "$ARTIFACT_ROOT"
+          git diff --numstat "$BASE_SHA" "$HEAD_SHA" > "$ARTIFACT_ROOT/numstat.txt"
+          changed_lines=$(awk '{ added += $1; deleted += $2 } END { print added + deleted + 0 }' "$ARTIFACT_ROOT/numstat.txt")
+          echo "changed_lines=$changed_lines" >> "$GITHUB_OUTPUT"
+
+          verification=pass
+          {
+            echo '## cargo fmt --all -- --check'
+            if ! cargo fmt --all -- --check; then verification=fail; fi
+            echo
+            echo '## cargo check'
+            if ! cargo check; then verification=fail; fi
+            echo
+            echo '## cargo test'
+            if ! cargo test; then verification=fail; fi
+          } 2>&1 | tee "$ARTIFACT_ROOT/verification.log"
+
+          if [[ "$verification" == "pass" ]]; then
+            cat > "$ARTIFACT_ROOT/review.md" <<EOF
+          ## kapi-agent review
+
+          **Verdict:** APPROVE
+
+          ## Final approval summary
+          ### Review journey
+          kapi-agent reviewed the pull request semantic scope, size gate, and Rust verification output.
+
+          ### What changed
+          This review covers the current PR diff for ${REPO}#${PR_NUMBER} at ${HEAD_SHA}.
+
+          ### Why this is correct
+          The automated gate accepts this revision because formatting, compile checks, and tests passed for the checked-out PR head.
+
+          ### Evidence
+          - cargo fmt --all -- --check: pass
+          - cargo check: pass
+          - cargo test: pass
+          - changed lines: ${changed_lines}
+
+          ### Remaining risks and approval rationale
+          Approval is limited to the automated verification and semantic scope visible to kapi-agent; human review still owns product judgment and merge authority.
+
+          ### Blocking issues
+          - none
+          EOF
+          else
+            cat > "$ARTIFACT_ROOT/review.md" <<EOF
+          ## kapi-agent review
+
+          **Verdict:** REQUEST_CHANGES
+
+          ### Blocking issues
+          - One or more required verification commands failed. See the kapi-agent/review check output and workflow log.
+
+          ### Evidence
+          - cargo fmt --all -- --check / cargo check / cargo test: ${verification}
+          - changed lines: ${changed_lines}
+          EOF
+          fi
+          sed -i 's/^          //' "$ARTIFACT_ROOT/review.md"
+
+          prior_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate --jq '[.[] | select(.body | startswith("## kapi-agent review"))][-1] // empty')
+          prior_state=$(jq -r 'if .state == "APPROVED" then "APPROVE" elif .state == "CHANGES_REQUESTED" then "REQUEST_CHANGES" elif .state == "COMMENTED" then "COMMENT" else empty end' <<<"${prior_json:-{}}")
+          prior_head=$(jq -r '.commit_id // empty' <<<"${prior_json:-{}}")
+
+          args=(github-pr --repo "$REPO" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA" --changed-lines "$changed_lines" --verification "$verification" --body-file "$ARTIFACT_ROOT/review.md" --artifact-root "$ARTIFACT_ROOT" --json)
+          if [[ -n "$prior_state" ]]; then args+=(--prior-review-state "$prior_state"); fi
+          if [[ -n "$prior_head" ]]; then args+=(--prior-head-sha "$prior_head"); fi
+          if [[ -n "$prior_state" && "$prior_head" != "$HEAD_SHA" ]]; then
+            printf 'what changed: new PR revision\nwhy: previous kapi-agent review was for %s\nverification: reran fmt/check/test on %s\n' "$prior_head" "$HEAD_SHA" > "$ARTIFACT_ROOT/revision.md"
+            args+=(--revision-explanation-file "$ARTIFACT_ROOT/revision.md" --refresh-check)
+          fi
+
+          (cd .kapi-reviewer && node --import tsx src/cli/kapi-review-cli.ts "${args[@]}") > "$ARTIFACT_ROOT/result.json"
+          jq -r '.review_event' "$ARTIFACT_ROOT/result.json" > "$ARTIFACT_ROOT/review_event.txt"
+          jq -r '.check_conclusion' "$ARTIFACT_ROOT/result.json" > "$ARTIFACT_ROOT/check_conclusion.txt"
+          jq -r '.body' "$ARTIFACT_ROOT/result.json" > "$ARTIFACT_ROOT/final_review.md"
+
+          {
+            echo "review_event=$(cat "$ARTIFACT_ROOT/review_event.txt")"
+            echo "check_conclusion=$(cat "$ARTIFACT_ROOT/check_conclusion.txt")"
+            echo "artifact_root=$ARTIFACT_ROOT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish kapi-agent check
+        if: always() && steps.prepare.outputs.check_conclusion != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CONCLUSION: ${{ steps.prepare.outputs.check_conclusion }}
+          ARTIFACT_ROOT: ${{ steps.prepare.outputs.artifact_root }}
+        run: |
+          summary=$(jq -r '"verdict: \(.verdict)\ncheck: \(.check_conclusion)\ngates: " + (.gates | to_entries | map("\(.key)=\(.value)") | join(", "))' "$ARTIFACT_ROOT/result.json")
+          gh api "repos/${REPO}/check-runs" \
+            -X POST \
+            -f name='kapi-agent/review' \
+            -f head_sha="$HEAD_SHA" \
+            -f status='completed' \
+            -f conclusion="$CONCLUSION" \
+            -f output.title='kapi-agent review' \
+            -f output.summary="$summary"
+
+      - name: Submit kapi-agent PR review
+        if: always() && steps.prepare.outputs.review_event != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_EVENT: ${{ steps.prepare.outputs.review_event }}
+          ARTIFACT_ROOT: ${{ steps.prepare.outputs.artifact_root }}
+        run: |
+          body=$(cat "$ARTIFACT_ROOT/final_review.md")
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            -X POST \
+            -f event="$REVIEW_EVENT" \
+            -f body="$body"
+
+      - name: Upload kapi-agent artifacts
+        if: always() && steps.prepare.outputs.artifact_root != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kapi-agent-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ steps.prepare.outputs.artifact_root }}
