@@ -172,6 +172,8 @@ pub struct MonitorConfig {
     pub git: GitMonitorConfig,
     #[serde(default)]
     pub tmux: TmuxMonitorConfig,
+    #[serde(default)]
+    pub kapi: KapiMonitorConfig,
 }
 
 impl Default for MonitorConfig {
@@ -182,6 +184,7 @@ impl Default for MonitorConfig {
             github_api_base: default_github_api_base(),
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
+            kapi: KapiMonitorConfig::default(),
         }
     }
 }
@@ -232,6 +235,39 @@ impl Default for GitRepoMonitor {
             channel: None,
             mention: None,
             format: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KapiMonitorConfig {
+    #[serde(default)]
+    pub repos: Vec<KapiRepoMonitor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KapiRepoMonitor {
+    /// Repository path passed to `kapi events --from <repo>`.
+    pub from: String,
+    pub channel: Option<String>,
+    pub mention: Option<String>,
+    #[serde(default = "default_kapi_stale_minutes")]
+    pub stale_minutes: u64,
+    pub format: Option<MessageFormat>,
+    pub cursor_path: Option<String>,
+    pub kapi_bin: Option<String>,
+}
+
+impl Default for KapiRepoMonitor {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            channel: None,
+            mention: None,
+            stale_minutes: default_kapi_stale_minutes(),
+            format: None,
+            cursor_path: None,
+            kapi_bin: None,
         }
     }
 }
@@ -292,6 +328,9 @@ fn default_remote() -> String {
 }
 fn default_stale_minutes() -> u64 {
     10
+}
+fn default_kapi_stale_minutes() -> u64 {
+    5
 }
 fn default_keyword_window_secs() -> u64 {
     30

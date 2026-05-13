@@ -5,10 +5,12 @@ use crate::events::IncomingEvent;
 
 pub mod git;
 pub mod github;
+pub mod kapi;
 pub mod tmux;
 
 pub use git::GitSource;
 pub use github::GitHubSource;
+pub use kapi::KapiSource;
 pub use tmux::{RegisteredTmuxSession, SharedTmuxRegistry, TmuxSource};
 
 #[async_trait::async_trait]

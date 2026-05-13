@@ -22,7 +22,8 @@ use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
 use crate::source::{
-    GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
+    GitHubSource, GitSource, KapiSource, RegisteredTmuxSession, SharedTmuxRegistry, Source,
+    TmuxSource,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -70,6 +71,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         ),
         tx.clone(),
     );
+    spawn_source(KapiSource::new(config.clone()), tx.clone());
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -133,6 +135,7 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "daemon_base_url": config.daemon.base_url,
         "configured_git_monitors": config.monitors.git.repos.len(),
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
+        "configured_kapi_monitors": config.monitors.kapi.repos.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
     })
 }
@@ -678,6 +681,12 @@ mod tests {
             payload["summary"]["tool_hint_counts"]["cargo test"],
             Value::from(1)
         );
-        assert_eq!(payload["summary"]["tool_error_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["summary"]["tool_error_sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

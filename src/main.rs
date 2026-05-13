@@ -7,6 +7,7 @@ mod dispatch;
 mod dynamic_tokens;
 mod event;
 mod events;
+mod kapi_wrapper;
 mod keyword_window;
 mod lifecycle;
 mod memory;
@@ -25,8 +26,8 @@ use std::sync::Arc;
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, MemoryCommands,
-    PluginCommands, TmuxCommands,
+    AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, KapiCommands,
+    MemoryCommands, PluginCommands, TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -205,6 +206,9 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
+        },
+        Commands::Kapi { command } => match command {
+            KapiCommands::Watch(args) => kapi_wrapper::watch(args, config.as_ref()).await,
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {

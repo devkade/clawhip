@@ -76,6 +76,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: TmuxCommands,
     },
+    /// Watch Kapi worker events and forward them through clawhip.
+    Kapi {
+        #[command(subcommand)]
+        command: KapiCommands,
+    },
     /// Install clawhip from the current git clone.
     Install {
         /// Install and start the bundled systemd service.
@@ -392,6 +397,39 @@ pub struct TmuxWatchArgs {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum KapiCommands {
+    /// Poll `kapi events` and forward Kapi worker events through the local clawhip daemon.
+    Watch(KapiWatchArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct KapiWatchArgs {
+    /// Repository path passed to `kapi events --from <repo>`.
+    #[arg(long = "from")]
+    pub from: String,
+    #[arg(long)]
+    pub channel: Option<String>,
+    #[arg(long)]
+    pub mention: Option<String>,
+    #[arg(long, default_value_t = 5)]
+    pub stale_minutes: u64,
+    #[arg(long)]
+    pub format: Option<MessageFormat>,
+    /// Path for the persisted per-repo cursor. Defaults under ~/.clawhip/kapi-cursors/.
+    #[arg(long)]
+    pub cursor_path: Option<PathBuf>,
+    /// Override the kapi binary path. Also supports CLAWHIP_KAPI_BIN.
+    #[arg(long)]
+    pub kapi_bin: Option<String>,
+    /// Seconds between polls in long-running watch mode.
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_secs: u64,
+    /// Poll once and exit. Useful for smoke tests and cron-style operation.
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum MemoryCommands {
     /// Create a filesystem-offloaded memory scaffold in a repo or workspace.
@@ -639,8 +677,8 @@ mod tests {
             "clawhip",
             "tmux",
             "watch",
-            "-s",
-            "issue-13",
+            "--session",
+            "issue-123",
             "--channel",
             "alerts",
             "--mention",
@@ -648,26 +686,66 @@ mod tests {
             "--keywords",
             "error,complete",
             "--stale-minutes",
-            "15",
+            "7",
             "--format",
-            "alert",
+            "inline",
         ]);
 
         let Commands::Tmux { command } = cli.command.expect("tmux command") else {
             panic!("expected tmux command");
         };
-
         let TmuxCommands::Watch(args) = command else {
-            panic!("expected tmux watch command");
+            panic!("expected tmux watch");
         };
-
-        assert_eq!(args.session, "issue-13");
+        assert_eq!(args.session, "issue-123");
         assert_eq!(args.channel.as_deref(), Some("alerts"));
         assert_eq!(args.mention.as_deref(), Some("<@123>"));
         assert_eq!(args.keywords, vec!["error", "complete"]);
-        assert_eq!(args.stale_minutes, 15);
-        assert!(args.retry_enter);
-        assert!(matches!(args.format, Some(TmuxWrapperFormat::Alert)));
+        assert_eq!(args.stale_minutes, 7);
+        assert!(matches!(args.format, Some(TmuxWrapperFormat::Inline)));
+    }
+
+    #[test]
+    fn parses_kapi_watch_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "kapi",
+            "watch",
+            "--from",
+            "/repos/kapi",
+            "--channel",
+            "alerts",
+            "--mention",
+            "<@hermes>",
+            "--stale-minutes",
+            "5",
+            "--format",
+            "compact",
+            "--cursor-path",
+            "/tmp/kapi.cursor",
+            "--kapi-bin",
+            "/opt/bin/kapi",
+            "--poll-interval-secs",
+            "2",
+            "--once",
+        ]);
+
+        let Commands::Kapi { command } = cli.command.expect("kapi command") else {
+            panic!("expected kapi command");
+        };
+        let KapiCommands::Watch(args) = command;
+        assert_eq!(args.from, "/repos/kapi");
+        assert_eq!(args.channel.as_deref(), Some("alerts"));
+        assert_eq!(args.mention.as_deref(), Some("<@hermes>"));
+        assert_eq!(args.stale_minutes, 5);
+        assert!(matches!(args.format, Some(MessageFormat::Compact)));
+        assert_eq!(
+            args.cursor_path.as_deref(),
+            Some(std::path::Path::new("/tmp/kapi.cursor"))
+        );
+        assert_eq!(args.kapi_bin.as_deref(), Some("/opt/bin/kapi"));
+        assert_eq!(args.poll_interval_secs, 2);
+        assert!(args.once);
     }
 
     #[test]

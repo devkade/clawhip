@@ -14,6 +14,9 @@ impl Renderer for DefaultRenderer {
         if event.canonical_kind() == "pi.state-summary" {
             return render_pi_state_summary(payload, format);
         }
+        if event.canonical_kind().starts_with("kapi.worker.") {
+            return render_kapi_worker_event(event.canonical_kind(), payload, format);
+        }
         if event.canonical_kind().starts_with("session.") {
             return render_session_event(event.canonical_kind(), payload, format);
         }
@@ -354,6 +357,47 @@ fn agent_inline_suffix(payload: &Value) -> String {
     } else {
         format!(" · {}", parts.join(" · "))
     }
+}
+
+fn render_kapi_worker_event(kind: &str, payload: &Value, format: &MessageFormat) -> Result<String> {
+    if matches!(format, MessageFormat::Raw) {
+        return Ok(serde_json::to_string_pretty(payload)?);
+    }
+
+    let repo = optional_string_field(payload, "repo_name")
+        .or_else(|| optional_string_field(payload, "repo"))
+        .unwrap_or_else(|| "kapi".to_string());
+    let slug = optional_string_field(payload, "slug")
+        .or_else(|| optional_string_field(payload, "worker_id"))
+        .or_else(|| optional_string_field(payload, "tmux_session"))
+        .unwrap_or_else(|| "worker".to_string());
+    let status = optional_string_field(payload, "status").unwrap_or_else(|| {
+        kind.strip_prefix("kapi.worker.")
+            .unwrap_or(kind)
+            .to_string()
+    });
+    let mut parts = Vec::new();
+    if let Some(reason) = optional_string_field(payload, "reason") {
+        parts.push(format!("reason={reason}"));
+    }
+    if let Some(action) = optional_string_field(payload, "recommended_action") {
+        parts.push(format!("action=`{action}`"));
+    }
+    if let Some(mode) = optional_string_field(payload, "mode") {
+        parts.push(format!("mode={mode}"));
+    }
+    let detail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    };
+
+    Ok(match format {
+        MessageFormat::Compact => format!("kapi {repo} {slug} {status}{detail}"),
+        MessageFormat::Alert => format!("🚨 kapi {repo} {slug} {status}{detail}"),
+        MessageFormat::Inline => format!("[kapi:{repo}/{slug}] {status}{detail}"),
+        MessageFormat::Raw => unreachable!(),
+    })
 }
 
 fn render_session_event(kind: &str, payload: &Value, format: &MessageFormat) -> Result<String> {

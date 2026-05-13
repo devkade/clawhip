@@ -251,6 +251,7 @@ fn route_candidates(kind: &str) -> Vec<&str> {
         | "session.handoff-needed" => {
             vec![kind, "session.*"]
         }
+        other if other.starts_with("kapi.worker.") => vec![other, "kapi.worker.*", "kapi.*"],
         other => vec![other],
     }
 }

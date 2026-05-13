@@ -200,6 +200,34 @@ List installed plugins with:
 clawhip plugin list
 ```
 
+### Kapi worker events
+
+clawhip can watch Kapi's semantic worker event stream and route it through the normal renderer/sink pipeline:
+
+```bash
+clawhip kapi watch --from /path/to/kapi \
+  --channel YOUR_CHANNEL_OR_THREAD_ID \
+  --mention "<@hermes-bot-id>" \
+  --stale-minutes 5 \
+  --format compact
+```
+
+The watcher polls `kapi events --from <repo> --since <cursor> --json`, persists a per-repo cursor under `~/.clawhip/kapi-cursors/` by default, and emits canonical `kapi.worker.*` events. Compact rendering includes the repo, slug/worker id, status, reason, and `recommended_action` so Hermes/Ragna can follow with commands such as `kapi report <slug> --from <repo> --json`.
+
+For daemon-managed polling, configure a monitor:
+
+```toml
+[monitors]
+poll_interval_secs = 5
+
+[[monitors.kapi.repos]]
+from = "/path/to/kapi"
+channel = "YOUR_CHANNEL_OR_THREAD_ID"
+mention = "<@hermes-bot-id>"
+stale_minutes = 5
+format = "compact"
+```
+
 ## Description
 
 Operational spec for OpenClaw / Clawdbot agents consuming this repo.
