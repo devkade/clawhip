@@ -5,6 +5,7 @@ use serde_json::Value;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::events::MessageFormat;
+use crate::source::kapi::KapiWatchOptions;
 
 pub const DEFAULT_RETRY_ENTER_COUNT: u32 = 4;
 pub const DEFAULT_RETRY_ENTER_DELAY_MS: u64 = 250;
@@ -75,6 +76,11 @@ pub enum Commands {
     Tmux {
         #[command(subcommand)]
         command: TmuxCommands,
+    },
+    /// Watch Kapi worker events and forward them through clawhip.
+    Kapi {
+        #[command(subcommand)]
+        command: KapiCommands,
     },
     /// Install clawhip from the current git clone.
     Install {
@@ -390,6 +396,63 @@ pub struct TmuxWatchArgs {
     pub repo_path: Option<String>,
     #[arg(long)]
     pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum KapiCommands {
+    /// Poll `kapi events` and forward worker events to the local daemon.
+    Watch(KapiWatchArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct KapiWatchArgs {
+    /// Repository root to pass to `kapi events --from`.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Discord channel id/name to use as the route hint.
+    #[arg(long)]
+    pub channel: Option<String>,
+    /// Mention to include when Kapi recommends a follow-up action.
+    #[arg(long)]
+    pub mention: Option<String>,
+    /// Stale threshold metadata to preserve on forwarded events.
+    #[arg(long, default_value_t = 5)]
+    pub stale_minutes: u64,
+    /// Message format for forwarded Kapi events.
+    #[arg(long, value_enum, default_value = "compact")]
+    pub format: MessageFormat,
+    /// Persisted cursor file. Defaults to CLAWHIP_STATE_DIR/HOME based path.
+    #[arg(long)]
+    pub cursor_file: Option<PathBuf>,
+    /// Poll interval for continuous watch mode.
+    #[arg(long, default_value_t = 15)]
+    pub poll_interval_secs: u64,
+    /// Poll once, forward available events, persist the cursor, then exit.
+    #[arg(long, default_value_t = false)]
+    pub once: bool,
+    /// Exact Discord thread/topic id to preserve for downstream routing.
+    #[arg(long)]
+    pub discord_topic_id: Option<String>,
+    /// Fail fast unless --discord-topic-id is provided.
+    #[arg(long, default_value_t = false)]
+    pub require_discord_topic: bool,
+}
+
+impl From<KapiWatchArgs> for KapiWatchOptions {
+    fn from(args: KapiWatchArgs) -> Self {
+        Self {
+            from: args.from,
+            channel: args.channel,
+            mention: args.mention,
+            stale_minutes: args.stale_minutes,
+            format: args.format,
+            cursor_file: args.cursor_file,
+            poll_interval_secs: args.poll_interval_secs,
+            once: args.once,
+            discord_topic_id: args.discord_topic_id,
+            require_discord_topic: args.require_discord_topic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -754,6 +817,49 @@ mod tests {
         };
 
         assert!(matches!(command, PluginCommands::List));
+    }
+
+    #[test]
+    fn parses_kapi_watch_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "kapi",
+            "watch",
+            "--from",
+            "/repo/kapi",
+            "--channel",
+            "alerts",
+            "--mention",
+            "<@123>",
+            "--stale-minutes",
+            "7",
+            "--format",
+            "inline",
+            "--cursor-file",
+            "/tmp/kapi.cursor",
+            "--poll-interval-secs",
+            "3",
+            "--once",
+            "--discord-topic-id",
+            "456",
+            "--require-discord-topic",
+        ]);
+
+        let Commands::Kapi { command } = cli.command.expect("kapi command") else {
+            panic!("expected kapi command");
+        };
+        let KapiCommands::Watch(args) = command;
+
+        assert_eq!(args.from, PathBuf::from("/repo/kapi"));
+        assert_eq!(args.channel.as_deref(), Some("alerts"));
+        assert_eq!(args.mention.as_deref(), Some("<@123>"));
+        assert_eq!(args.stale_minutes, 7);
+        assert!(matches!(args.format, MessageFormat::Inline));
+        assert_eq!(args.cursor_file, Some(PathBuf::from("/tmp/kapi.cursor")));
+        assert_eq!(args.poll_interval_secs, 3);
+        assert!(args.once);
+        assert_eq!(args.discord_topic_id.as_deref(), Some("456"));
+        assert!(args.require_discord_topic);
     }
 
     #[test]

@@ -1366,6 +1366,33 @@ mod tests {
     }
 
     #[test]
+    fn renders_kapi_worker_events_with_actionable_context() {
+        let event = IncomingEvent {
+            kind: "kapi.worker.review-ready".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "repo_name": "devkade/kapi",
+                "slug": "issue-58-watchdog",
+                "status": "review-ready",
+                "reason": "terminal marker matched: review-ready",
+                "recommended_action": "kapi report issue-58-watchdog --from /repo/kapi --json"
+            }),
+        };
+
+        assert_eq!(
+            event.render_default(&MessageFormat::Compact).unwrap(),
+            "kapi devkade/kapi/issue-58-watchdog review-ready · reason=terminal marker matched: review-ready · action=kapi report issue-58-watchdog --from /repo/kapi --json"
+        );
+        assert_eq!(
+            event.render_default(&MessageFormat::Inline).unwrap(),
+            "[kapi:issue-58-watchdog] review-ready · devkade/kapi · review-ready · terminal marker matched: review-ready · kapi report issue-58-watchdog --from /repo/kapi --json"
+        );
+    }
+
+    #[test]
     fn git_commit_events_keep_single_commit_rendering() {
         let events = IncomingEvent::git_commit_events(
             "repo".into(),

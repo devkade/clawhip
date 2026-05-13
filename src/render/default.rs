@@ -17,6 +17,9 @@ impl Renderer for DefaultRenderer {
         if event.canonical_kind().starts_with("session.") {
             return render_session_event(event.canonical_kind(), payload, format);
         }
+        if event.canonical_kind().starts_with("kapi.worker.") {
+            return render_kapi_worker_event(event.canonical_kind(), payload, format);
+        }
         if event.canonical_kind() == "git.commit"
             && let Some(rendered) = render_aggregated_git_commit(payload, format)?
         {
@@ -353,6 +356,53 @@ fn agent_inline_suffix(payload: &Value) -> String {
         String::new()
     } else {
         format!(" · {}", parts.join(" · "))
+    }
+}
+
+fn render_kapi_worker_event(kind: &str, payload: &Value, format: &MessageFormat) -> Result<String> {
+    let event = kind.strip_prefix("kapi.worker.").unwrap_or(kind);
+    let repo = optional_string_field(payload, "repo_name")
+        .or_else(|| optional_string_field(payload, "repo"))
+        .unwrap_or_else(|| "unknown-repo".to_string());
+    let slug = optional_string_field(payload, "slug")
+        .or_else(|| optional_string_field(payload, "worker_id"))
+        .unwrap_or_else(|| "unknown-worker".to_string());
+    let status = optional_string_field(payload, "status").unwrap_or_else(|| event.to_string());
+    let reason = optional_string_field(payload, "reason");
+    let action = optional_string_field(payload, "recommended_action");
+
+    match format {
+        MessageFormat::Compact => {
+            let mut parts = vec![format!("kapi {repo}/{slug} {status}")];
+            if let Some(reason) = reason {
+                parts.push(format!("reason={reason}"));
+            }
+            if let Some(action) = action {
+                parts.push(format!("action={action}"));
+            }
+            Ok(parts.join(" · "))
+        }
+        MessageFormat::Alert => {
+            let mut rendered = format!("🚨 kapi {repo}/{slug} {status}");
+            if let Some(reason) = reason {
+                rendered.push_str(&format!(" · {reason}"));
+            }
+            if let Some(action) = action {
+                rendered.push_str(&format!(" · run: {action}"));
+            }
+            Ok(rendered)
+        }
+        MessageFormat::Inline => {
+            let mut parts = vec![format!("[kapi:{slug}] {event}"), repo, status];
+            if let Some(reason) = reason {
+                parts.push(reason);
+            }
+            if let Some(action) = action {
+                parts.push(action);
+            }
+            Ok(parts.join(" · "))
+        }
+        MessageFormat::Raw => Ok(serde_json::to_string_pretty(payload)?),
     }
 }
 

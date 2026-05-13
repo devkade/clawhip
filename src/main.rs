@@ -25,8 +25,8 @@ use std::sync::Arc;
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, MemoryCommands,
-    PluginCommands, TmuxCommands,
+    AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, KapiCommands,
+    MemoryCommands, PluginCommands, TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -205,6 +205,12 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
+        },
+        Commands::Kapi { command } => match command {
+            KapiCommands::Watch(args) => {
+                let client = DaemonClient::from_config(config.as_ref());
+                crate::source::kapi::watch_daemon(client, args.into()).await
+            }
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {
